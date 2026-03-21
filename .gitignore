@@ -1,2 +1,2 @@
-mini_llm/weights/
-mini_llm/__pycache__/
+pico_vllm/weights/
+pico_vllm/__pycache__/
