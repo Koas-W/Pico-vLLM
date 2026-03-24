@@ -1,0 +1,1 @@
+1、model的GQAAttention中，freqs_cis相关的实现效率不高，需要优化

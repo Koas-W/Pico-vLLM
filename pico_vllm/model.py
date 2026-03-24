@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+from cache import KVCache
 
 @dataclass
 class ModelConfig:
@@ -73,9 +74,10 @@ class RoPE(nn.Module):
         return self.apply_rope(x, freqs_cis)
 
 class GQAAttention(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, layer_idx):
         super().__init__()
         self.cfg = cfg
+        self.layer_idx = layer_idx
         self.q_proj = nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=True)
         # k_proj: (B, seq_len, hidden_size) -> (B, seq_len, num_kv_heads * head_dim)
         self.k_proj = nn.Linear(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim, bias=True)
@@ -83,18 +85,40 @@ class GQAAttention(nn.Module):
         self.o_proj = nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=False)
         self.rope = RoPE(cfg.head_dim, cfg.rope_theta)
 
-    def forward(self, x, freqs_cis, attention_mask=None, kv_cache=None):
+    def forward(self, x, freqs_cis, kv_cache: KVCache, attention_mask=None):
         # x: (B, seq_len, hidden_size)
+        # 如果使用KV cache：
+        # prefill: kv_cache.seq_len == 0，处理整个 prompt，kv_cache 还没有内容
+        # decode:  kv_cache.seq_len != 0，只处理一个新 token，kv_cache有kv_cache.seq_len的内容
         B, seq_len, _ = x.shape
         # q_proj: (B, seq_len, hidden_size) -> (B, seq_len, num_heads, head_dim)
         # k_proj, v_proj: (B, seq_len, hidden_size) -> (B, seq_len, num_kv_heads, head_dim)
         q = self.q_proj(x).view(B, seq_len, self.cfg.num_attention_heads, self.cfg.head_dim)
         k = self.k_proj(x).view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
         v = self.v_proj(x).view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
-        # q: (B, seq_len, num_heads, head_dim) -> (B, seq_len, num_heads, head_dim) 经过 RoPE 加位置信息
-        # k: (B, seq_len, num_kv_heads, head_dim) -> (B, seq_len, num_kv_heads, head_dim) 经过 RoPE 加位置信息
+
+        # RoPE
+        # 如果使用 KV cache，位置编码起始位置由 KV cache 的 seq_len 决定
+        # prefill: seq_len > 1，位置编码从 0 开始
+        # decode: seq_len = 1，位置编码从当前已缓存的 seq_len 开始
+        # 在外部传入的时候自动处理了所以不再需要分支了
         q = self.rope.apply_rope(q, freqs_cis)
         k = self.rope.apply_rope(k, freqs_cis)
+        # 此时的shape为(B, seq_len, num_kv_heads, head_dim),恰好适合后续写入 KV cache
+        # 取出历史 KV
+        # k_history, v_history: (seq_len_cache, num_kv_heads, head_dim)
+        k_history, v_history = kv_cache.get(self.layer_idx)
+        # (seq_len_cache, num_kv_heads, head_dim) -> (1, seq_len_cache, num_kv_heads, head_dim)
+        k_history = k_history.unsqueeze(0) 
+        v_history = v_history.unsqueeze(0)
+        # 目前只处理B=1的情况，所以直接 squeeze 掉 batch 维度
+        k_to_store = k.squeeze(0)
+        v_to_store = v.squeeze(0)
+        kv_cache.update(self.layer_idx, k_to_store, v_to_store)
+        # 拼接：历史 + 新的
+        # (1, seq_len_cache, num_kv_heads, head_dim) + (1, seq_len_new, num_kv_heads, head_dim) -> (1, seq_len_total, num_kv_heads, head_dim)
+        k = torch.cat([k_history, k], dim=1)
+        v = torch.cat([v_history, v], dim=1)
         # q: (B, seq_len, num_heads, head_dim) -> (B, num_heads, seq_len, head_dim)
         # k: (B, seq_len, num_kv_heads, head_dim) -> (B, num_kv_heads, seq_len, head_dim)
         # v: (B, seq_len, num_kv_heads, head_dim) -> (B, num_kv_heads, seq_len, head_dim)
@@ -112,9 +136,17 @@ class GQAAttention(nn.Module):
             attn_scores = attn_scores + attention_mask
         # 否则应用 causal mask
         else:
-            causal_mask = torch.full((seq_len, seq_len), float('-inf'), device=x.device, dtype=x.dtype)
-            causal_mask = torch.triu(causal_mask, diagonal=1)  # 上三角为 -inf，对角线及以下为 0
-            attn_scores = attn_scores + causal_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+            # 当有Prefix Cache的时候，q_len和k_len即使是在prefill阶段也不相等，q_len < k_len
+            q_len = q.shape[2]    # transpose 之后
+            k_len = k.shape[2]
+            if q_len > 1:
+                causal_mask = torch.full((q_len, k_len), float('-inf'), device=x.device, dtype=x.dtype)
+                causal_mask = torch.triu(causal_mask, diagonal=k_len - q_len + 1)
+                attn_scores = attn_scores + causal_mask.unsqueeze(0).unsqueeze(0)
+            # if seq_len > 1:  # seq_len=1 时不需要 mask
+            #     causal_mask = torch.full((seq_len, seq_len), float('-inf'), device=x.device, dtype=x.dtype)
+            #     causal_mask = torch.triu(causal_mask, diagonal=1)  # 上三角为 -inf，对角线及以下为 0
+            #     attn_scores = attn_scores + causal_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
         # attn_probs: (B, num_heads, seq_len, seq_len)
         attn_probs = F.softmax(attn_scores, dim=-1)
         # attn_output: (B, num_heads, seq_len, head_dim)
@@ -145,17 +177,18 @@ class SwiGLUFFN(nn.Module):
 # Transformer block
 #############################################################
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, layer_idx):
         super().__init__()
         self.cfg = cfg
-        self.attn = GQAAttention(cfg)
+        self.layer_idx = layer_idx
+        self.attn = GQAAttention(cfg, layer_idx=layer_idx)
         self.ffn = SwiGLUFFN(cfg)
         self.norm1 = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.norm2 = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
-    def forward(self, x, freqs_cis, attention_mask=None, kv_cache=None):
+    def forward(self, x, freqs_cis, kv_cache, attention_mask=None):
         # x: (B, seq_len, hidden_size)
-        attn_out = self.attn(self.norm1(x), freqs_cis, attention_mask, kv_cache)  # (B, seq_len, hidden_size)
+        attn_out = self.attn(self.norm1(x), freqs_cis, kv_cache=kv_cache, attention_mask=attention_mask)  # (B, seq_len, hidden_size)
         x = x + attn_out  # 残差连接
         ffn_out = self.ffn(self.norm2(x))  # (B, seq_len, hidden_size)
         x = x + ffn_out  # 残差连接
@@ -170,20 +203,21 @@ class Qwen25_15B(nn.Module):
         self.cfg = cfg
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.rope = RoPE(cfg.head_dim, cfg.rope_theta)
-        self.layers = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_hidden_layers)])
+        self.layers = nn.ModuleList([TransformerBlock(cfg, layer_idx=i) for i in range(cfg.num_hidden_layers)])
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         if not cfg.tie_word_embeddings:
             self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         else:
             self.lm_head = None  # 后面 forward 里会用 embed_tokens.weight 来做输出投影
 
-    def forward(self, input_ids, attention_mask=None, kv_caches=None):
+    def forward(self, input_ids, kv_cache, attention_mask=None):
         # input_ids: (B, seq_len)
         x = self.embed_tokens(input_ids)  # (B, seq_len, hidden_size)
-        freqs_cis = self.rope.precompute_freqs_cis(x.shape[1]).to(x.device)
+        start_pos = kv_cache.seq_len if kv_cache is not None else 0
+        total_len = start_pos + x.shape[1]
+        freqs_cis = self.rope.precompute_freqs_cis(total_len)[start_pos:total_len].to(x.device)
         for i, layer in enumerate(self.layers):
-            kv_cache = kv_caches[i] if kv_caches is not None else None
-            x = layer(x, freqs_cis, attention_mask, kv_cache)
+            x = layer(x, freqs_cis, kv_cache=kv_cache, attention_mask=attention_mask)
         x = self.norm(x)  # (B, seq_len, hidden_size)
         if self.lm_head is not None:
             logits = self.lm_head(x)  # (B, seq_len, vocab_size)
