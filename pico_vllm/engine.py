@@ -15,7 +15,10 @@ class Engine:
                  cache_cls : type[PagedKVCache], 
                  cache_kwargs: dict|None = None, device='cuda',
                  use_cuda_graph=True,   # ← 新增开关
-                 max_batch_size=8,      # ← CUDA Graph 需要固定 batch size
+                 max_batch_size=8,      # ← CUDA Graph 需要固定 batch size,
+                 tp_size=1, 
+                 rank=0,
+                 manual_seed=42
                  ):
         self.model = model.to(device)
         # self.sampler = sampler
@@ -27,13 +30,19 @@ class Engine:
             block_manager=block_manager,   # ← 加这个
             num_layers=model.cfg.num_hidden_layers,
             max_seq_len=4096,
-            num_kv_heads=model.cfg.num_key_value_heads,
+            num_kv_heads=model.cfg.local_num_key_value_heads,
             head_dim=model.cfg.head_dim,
             device=device,
             dtype=next(model.parameters()).dtype,
         )
         self.block_manager = block_manager
         self.eos_token_id = tokenizer.eos_token_id
+
+        self.tp_size = tp_size
+        self.rank = rank
+        if tp_size > 1:
+            torch.manual_seed(manual_seed)
+            torch.cuda.manual_seed(manual_seed)
 
         self.scheduler = Scheduler(kv_cache_cls=cache_cls, kv_cache_kwargs=self.kv_cache_kwargs)
 
@@ -56,14 +65,6 @@ class Engine:
             dtype=torch.int32, device=self.device
         )
         self.static_context_lens = torch.zeros(self.max_batch_size, dtype=torch.int32, device=self.device)
-
-        # self.static_input_ids.fill_(1)
-        # self.static_position_ids.fill_(1)
-        # # 故意填一个大一点的 context_len，逼迫 Triton 编译出能扛长序列的强壮 Kernel
-        # self.static_context_lens.fill_(1) 
-        # self.static_slot_mapping.fill_(0)
-        # # 假装大家都分配了第 0 个物理块（反正只是预热，读里面的 0 没关系）
-        # self.static_block_table.fill_(0)
 
         # 预热（触发 Triton autotune）
         for _ in range(3):

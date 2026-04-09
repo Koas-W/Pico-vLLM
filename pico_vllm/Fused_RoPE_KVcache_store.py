@@ -69,9 +69,9 @@ def _fused_decode_rope_and_cache_kernel(
     tl.store(q_rot_base + d_offsets_2, q_rot_2)
 
     # =======================================================
-    # 3. 计算 K 的 RoPE，并直接带着 V 写入 Paged KV Cache
+    # 3. 计算 K 的 RoPE，并将 KV 写入 Paged KV Cache
     # =======================================================
-    # 只有前 num_kv_heads 个 block 负责写入 KV，完美兼容 GQA
+    # 只有前 num_kv_heads 个 block 负责写入 KV，以兼容 GQA
     if q_head_idx < num_kv_heads:
         kv_head_idx = q_head_idx
         
@@ -88,12 +88,12 @@ def _fused_decode_rope_and_cache_kernel(
         k_rot_1 = k_1 * cos_1 - k_2 * sin_1
         k_rot_2 = k_2 * cos_2 + k_1 * sin_2
 
-        # 极限省显存：算完直接写入 Paged Cache，绝不落入全局连续显存
+        # 写入 Paged Cache
         kc_base = k_cache_ptr + blk_idx * stride_kc_blk + kv_head_idx * stride_kc_h + blk_off * stride_kc_seq
         tl.store(kc_base + d_offsets_1, k_rot_1)
         tl.store(kc_base + d_offsets_2, k_rot_2)
 
-        # ---- 处理 V (不需要旋转，直接读写) ----
+        # ---- 处理 V ----
         v_base = v_ptr + tok_idx * stride_v_tok + kv_head_idx * stride_v_h
         v = tl.load(v_base + d_offsets)
         
@@ -124,7 +124,7 @@ def fused_decode_rope_and_cache(
     
     total_tokens = B * seq_len
 
-    # 将所有输入安全地展平为 2D/3D，绝不拷贝数据 (view 是 O(1) 操作)
+    # 将所有输入展平为
     q_2d = q.view(total_tokens, num_q_heads, head_dim)
     k_2d = k.view(total_tokens, num_kv_heads, head_dim)
     v_2d = v.view(total_tokens, num_kv_heads, head_dim)

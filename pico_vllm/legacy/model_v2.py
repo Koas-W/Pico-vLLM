@@ -1,7 +1,6 @@
 # model.py
 import torch
 from torch import Tensor
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
@@ -24,7 +23,6 @@ class ModelConfig:
     rope_theta: float = 1000000.0
     max_position_embeddings: int = 131072
     tie_word_embeddings: bool = True
-    tp_size: int = 1
 
     BLOCK_SIZE = 16 # 目前硬编码为固定值
     MAX_BLOCKS_PER_SEQ = max_position_embeddings // BLOCK_SIZE  # 固定值，启动时确定
@@ -38,24 +36,14 @@ class ModelConfig:
         # 每个 KV 头服务几个 Q 头
         return self.num_attention_heads // self.num_key_value_heads
 
-    @property
-    def local_num_attention_heads(self):
-        return self.num_attention_heads // self.tp_size
-
-    @property
-    def local_num_key_value_heads(self):
-        return self.num_key_value_heads // self.tp_size
-
-    @property
-    def local_intermediate_size(self):
-        return self.intermediate_size // self.tp_size
-
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
 
+    # @torch.compile(fullgraph=True)
+    # @torch.compile(options={"epilogue_fusion": True})
     def forward(self, x):
         # x: (B, seq, hidden_size)
         rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
@@ -134,16 +122,16 @@ class GQAAttention(nn.Module):
             torch.tensor(layer_idx, dtype=torch.int32), 
             persistent=False
         )
-
-        # TP: 用 local head 数量计算维度
-        local_q_size = cfg.local_num_attention_heads * cfg.head_dim
-        local_kv_size = cfg.local_num_key_value_heads * cfg.head_dim
-        self.local_hidden = local_q_size  # o_proj 输出后 view 用
-
-        self.o_proj = nn.Linear(local_q_size, cfg.hidden_size, bias=False)
+        # self.q_proj = nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=True)
+        # # k_proj: (B, seq_len, hidden_size) -> (B, seq_len, num_kv_heads * head_dim)
+        # self.k_proj = nn.Linear(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim, bias=True)
+        # self.v_proj = nn.Linear(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim, bias=True)
+        self.o_proj = nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=False)
         self.qkv_proj = nn.Linear(
             cfg.hidden_size,
-            local_q_size + local_kv_size * 2,       # q + k + v
+            cfg.num_attention_heads * cfg.head_dim          # q
+            + cfg.num_key_value_heads * cfg.head_dim        # k  
+            + cfg.num_key_value_heads * cfg.head_dim,       # v
             bias=True
         )
 
@@ -159,7 +147,7 @@ class GQAAttention(nn.Module):
         
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         # (B, n_heads, seq, head_dim) → (B, seq, hidden)
-        return out.transpose(1, 2).contiguous().view(q.shape[0], -1, self.local_hidden)
+        return out.transpose(1, 2).contiguous().view(q.shape[0], -1, self.cfg.hidden_size)
 
     def _decode_attention(self, q, kv_cache_k, kv_cache_v, block_table, context_lens):
         # 直接从 cache 读，不再需要 k/v 参数
@@ -172,7 +160,7 @@ class GQAAttention(nn.Module):
             MAX_BLOCKS_PER_SEQ=block_table.shape[1],
         )
 
-        return out.transpose(1, 2).contiguous().view(B, 1, self.local_hidden)
+        return out.transpose(1, 2).contiguous().view(B, 1, self.cfg.hidden_size)
     
     def forward(self,
                 x: Tensor,                    # (B, seq_len, hidden_size)
@@ -187,19 +175,20 @@ class GQAAttention(nn.Module):
         B, seq_len, _ = x.shape
         qkv = self.qkv_proj(x)  # (B, seq, q_size + k_size + v_size)
 
-        q_size = self.cfg.local_num_attention_heads * self.cfg.head_dim
-        k_size = self.cfg.local_num_key_value_heads * self.cfg.head_dim
+        q_size = self.cfg.num_attention_heads * self.cfg.head_dim
+        k_size = self.cfg.num_key_value_heads * self.cfg.head_dim
 
         q, k, v = qkv.split([q_size, k_size, k_size], dim=-1)
-        q = q.view(B, seq_len, self.cfg.local_num_attention_heads, self.cfg.head_dim)
-        k = k.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-        v = v.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
+        q = q.view(B, seq_len, self.cfg.num_attention_heads, self.cfg.head_dim)
+        k = k.view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        v = v.view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
         
         # RoPE（两条路径共用）
         q, k = RoPE.apply_rope(q, k, cos, sin)
+        # print(v.is_contiguous())
         # k/v reshape 成 (total_tokens, n_kv_heads, head_dim) 给 store kernel
-        k_flat = k.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-        v_flat = v.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
+        k_flat = k.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        v_flat = v.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
 
         # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
         store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
@@ -209,10 +198,7 @@ class GQAAttention(nn.Module):
         else:
             output = self._decode_attention(q, kv_cache_k, kv_cache_v, block_table, context_lens)
 
-        output = self.o_proj(output)
-        if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
-        return output
+        return self.o_proj(output)
 
     def forward_prefill(self,
                 x: Tensor,                    # (B, seq_len, hidden_size)
@@ -226,30 +212,27 @@ class GQAAttention(nn.Module):
         B, seq_len, _ = x.shape
         qkv = self.qkv_proj(x)  # (B, seq, q_size + k_size + v_size)
 
-        q_size = self.cfg.local_num_attention_heads * self.cfg.head_dim
-        k_size = self.cfg.local_num_key_value_heads * self.cfg.head_dim
+        q_size = self.cfg.num_attention_heads * self.cfg.head_dim
+        k_size = self.cfg.num_key_value_heads * self.cfg.head_dim
 
         q, k, v = qkv.split([q_size, k_size, k_size], dim=-1)
-        q = q.view(B, seq_len, self.cfg.local_num_attention_heads, self.cfg.head_dim)
-        k = k.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-        v = v.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-
+        q = q.view(B, seq_len, self.cfg.num_attention_heads, self.cfg.head_dim)
+        k = k.view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        v = v.view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        
         # RoPE（两条路径共用）
         q, k = RoPE.apply_rope(q, k, cos, sin)
         # print(v.is_contiguous())
         # k/v reshape 成 (total_tokens, n_kv_heads, head_dim) 给 store kernel
-        k_flat = k.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-        v_flat = v.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
+        k_flat = k.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        v_flat = v.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
 
         # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
         store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
 
         output = self._prefill_attention(q, k, v)
 
-        output = self.o_proj(output)
-        if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
-        return output
+        return self.o_proj(output)
     
     def forward_decode(self,
                 x: Tensor,                    # (B, seq_len, hidden_size)
@@ -263,20 +246,20 @@ class GQAAttention(nn.Module):
         B, seq_len, _ = x.shape
         qkv = self.qkv_proj(x)  # (B, seq, q_size + k_size + v_size)
 
-        q_size = self.cfg.local_num_attention_heads * self.cfg.head_dim
-        k_size = self.cfg.local_num_key_value_heads * self.cfg.head_dim
+        q_size = self.cfg.num_attention_heads * self.cfg.head_dim
+        k_size = self.cfg.num_key_value_heads * self.cfg.head_dim
 
         q, k, v = qkv.split([q_size, k_size, k_size], dim=-1)
-        q = q.view(B, seq_len, self.cfg.local_num_attention_heads, self.cfg.head_dim)
-        k = k.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-        v = v.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-
+        q = q.view(B, seq_len, self.cfg.num_attention_heads, self.cfg.head_dim)
+        k = k.view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        v = v.view(B, seq_len, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        
         # RoPE（两条路径共用）
         # q, k = RoPE.apply_rope(q, k, cos, sin)
         # # print(v.is_contiguous())
         # # k/v reshape 成 (total_tokens, n_kv_heads, head_dim) 给 store kernel
-        # k_flat = k.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-        # v_flat = v.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
+        # k_flat = k.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
+        # v_flat = v.reshape(-1, self.cfg.num_key_value_heads, self.cfg.head_dim)
 
         # # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
         # store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
@@ -289,10 +272,7 @@ class GQAAttention(nn.Module):
 
         output = self._decode_attention(q_rot, kv_cache_k, kv_cache_v, block_table, context_lens)
 
-        output = self.o_proj(output)
-        if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
-        return output
+        return self.o_proj(output)
     
 class SwiGLUFFN(nn.Module):
     def __init__(self, cfg: ModelConfig):
@@ -301,21 +281,18 @@ class SwiGLUFFN(nn.Module):
         # self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
         # self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
         self.gate_up_proj = nn.Linear(
-            cfg.hidden_size, cfg.local_intermediate_size * 2, bias=False
+            cfg.hidden_size, cfg.intermediate_size * 2, bias=False
         )
-        self.down_proj = nn.Linear(cfg.local_intermediate_size, cfg.hidden_size, bias=False)
+        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, x):
         # x: (B, seq_len, hidden_size)
         # gate = self.gate_proj(x)  # (B, seq_len, intermediate_size)
         # up = self.up_proj(x)  # (B, seq_len, intermediate_size)
         gate_up = self.gate_up_proj(x)
-        gate, up = gate_up.split(self.cfg.local_intermediate_size, dim=-1)
-        output = self.down_proj(F.silu(gate) * up)  # (B, seq_len, hidden_size)
-        if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
-        return output  # (B, seq_len, hidden_size)
-
+        gate, up = gate_up.split(self.cfg.intermediate_size, dim=-1)
+        return self.down_proj(F.silu(gate) * up)  # (B, seq_len, hidden_size)
+    
     def forward_decode(self, x):
             # x: (B, 1, hidden_size)  -- 天然支持 B > 1
             # 1. 跑一次大矩阵乘法 (GEMV/GEMM)，算出 gate_up
@@ -325,10 +302,7 @@ class SwiGLUFFN(nn.Module):
             activated = fused_swiglu(gate_up)
             
             # 3. 再跑一次下采样矩阵乘法
-            output = self.down_proj(activated)
-            if self.cfg.tp_size > 1:
-                dist.all_reduce(output, op=dist.ReduceOp.SUM)
-            return output
+            return self.down_proj(activated)
 
 #############################################################
 # Transformer block

@@ -45,6 +45,7 @@ def sample(logits: torch.Tensor, temperature: float = 1.0, top_p: float = 1.0) -
     logits: (vocab_size,)
     return: () 标量
     """
+    logits = logits.squeeze()  # 确保始终是 (vocab_size,)
     if temperature == 0:
         return greedy(logits)
     elif top_p >= 1.0:
