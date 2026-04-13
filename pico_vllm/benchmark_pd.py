@@ -16,7 +16,7 @@ import sampler
 def create_engine(device, role="pd", use_cuda_graph=True, tp_size=1, rank=0):
     cfg = ModelConfig(tp_size=tp_size)
     model = Qwen25_15B(cfg)
-    model = load_weights(model, "./weights", tp_size=tp_size, rank=rank)
+    model = load_weights(model, "./weights", tp_size=tp_size, tp_rank=rank)
     model = model.to(torch.bfloat16).to(device)
     tokenizer = AutoTokenizer.from_pretrained("./weights")
     

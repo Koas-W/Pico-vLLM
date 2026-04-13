@@ -18,6 +18,7 @@ class Engine:
                  max_batch_size=8,      # ← CUDA Graph 需要固定 batch size,
                  tp_size=1, 
                  rank=0,
+                 peer_rank=0,
                  role:str="pd",
                  manual_seed=42
                  ):
@@ -48,11 +49,13 @@ class Engine:
         
         ### PD 分离相关设置 ###
         self.role = role
+        self.peer_rank = peer_rank
+        #peer_rank是需要自身rank向其传递KV cache的相应rank
         if self.role == "p":
-            self.transfer = AsyncKVTransfer(local_rank=rank, peer_rank=1, device=device,
+            self.transfer = AsyncKVTransfer(local_rank=rank, peer_rank=peer_rank, device=device,
                                             block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,role=role,)
         elif self.role == "d":
-            self.transfer = AsyncKVTransfer(local_rank=rank, peer_rank=0, device=device,
+            self.transfer = AsyncKVTransfer(local_rank=rank, peer_rank=peer_rank, device=device,
                                             block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,role=role,)
         else:
             # self.transfer = None  # role="pd" 不需要传输层

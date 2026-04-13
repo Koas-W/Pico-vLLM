@@ -66,7 +66,7 @@ def run_pd():
 
     cfg = ModelConfig()
     model = Qwen25_15B(cfg)
-    model = load_weights(model, "./weights")
+    model = load_weights(model, "./weights", tp_rank=rank)
     model = model.to(torch.bfloat16).to(device)
     tokenizer = AutoTokenizer.from_pretrained("./weights")
 

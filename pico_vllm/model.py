@@ -24,7 +24,11 @@ class ModelConfig:
     rope_theta: float = 1000000.0
     max_position_embeddings: int = 131072
     tie_word_embeddings: bool = True
+
+    #### 动态参数 ####
     tp_size: int = 1
+    tp_rank: int = 0
+    tp_group: object = None
 
     BLOCK_SIZE = 16 # 目前硬编码为固定值
     MAX_BLOCKS_PER_SEQ = max_position_embeddings // BLOCK_SIZE  # 固定值，启动时确定
@@ -211,7 +215,7 @@ class GQAAttention(nn.Module):
 
         output = self.o_proj(output)
         if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
         return output
 
     def forward_prefill(self,
@@ -248,7 +252,7 @@ class GQAAttention(nn.Module):
 
         output = self.o_proj(output)
         if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
         return output
     
     def forward_decode(self,
@@ -291,7 +295,7 @@ class GQAAttention(nn.Module):
 
         output = self.o_proj(output)
         if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
         return output
     
 class SwiGLUFFN(nn.Module):
@@ -313,7 +317,7 @@ class SwiGLUFFN(nn.Module):
         gate, up = gate_up.split(self.cfg.local_intermediate_size, dim=-1)
         output = self.down_proj(F.silu(gate) * up)  # (B, seq_len, hidden_size)
         if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
         return output  # (B, seq_len, hidden_size)
 
     def forward_decode(self, x):
@@ -327,7 +331,7 @@ class SwiGLUFFN(nn.Module):
             # 3. 再跑一次下采样矩阵乘法
             output = self.down_proj(activated)
             if self.cfg.tp_size > 1:
-                dist.all_reduce(output, op=dist.ReduceOp.SUM)
+                dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
             return output
 
 #############################################################
