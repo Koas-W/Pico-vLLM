@@ -185,10 +185,25 @@ class SyncKVTransfer(KVTransferBase):
 class AsyncKVTransfer(KVTransferBase):
     """Phase 2：异步非阻塞传输"""
 
-    def __init__(self, local_rank, peer_rank, device, block_manager, model_cfg,
-                 dtype=torch.bfloat16, cache_cls:type[PagedKVCache]=PagedKVCache, cache_kwargs: dict|None = None, role:str='pd'):
+    def __init__(self, local_rank, 
+                 device, 
+                 block_manager, 
+                 model_cfg,
+                 peer_ranks: list[int],       # 要发送/接受的对侧rank
+                 local_tp_size: int = 1,      # 本侧并行度
+                 remote_tp_size: int = 1,     # 对侧并行度
+                 is_primary: bool = True,     # 是否负责meta传输
+                 role:str='pd',
+                 dtype=torch.bfloat16, 
+                 cache_cls:type[PagedKVCache]=PagedKVCache, 
+                 cache_kwargs: dict|None = None, 
+                 ):
         self.local_rank = local_rank
-        self.peer_rank = peer_rank
+        self.peer_ranks = peer_ranks
+        self.local_tp_size = local_tp_size
+        self.remote_tp_size = remote_tp_size
+        self.is_primary = is_primary
+
         self.device = device
         self.block_manager = block_manager
         self.cfg = model_cfg
@@ -236,43 +251,61 @@ class AsyncKVTransfer(KVTransferBase):
     # P 侧：异步发送
     # =========================================================
     def send_request(self, request):
-        """非阻塞发送：fire-and-forget，poll() 时检查完成"""
         kv_data = self._gather_kv_cache(request)
+        # kv_data shape: (2, num_layers, num_blocks, local_kv_heads, block_size, head_dim)
 
-        meta = {
-            'request_id': request.request_id,
-            'input_ids': request.input_ids,
-            'generated_ids': list(request.generated_ids),  # 防止共享引用
-            'max_new_tokens': request.max_new_tokens,
-            'temperature': request.temperature,
-            'top_p': request.top_p,
-            'seq_len': request.kv_cache.seq_len,
-            'kv_shape': list(kv_data.shape),
-        }
+        # 一对多时，split 沿 head 维度
+        if len(self.peer_ranks) > 1:
+            kv_chunks = kv_data.chunk(len(self.peer_ranks), dim=3)
+        else:
+            kv_chunks = [kv_data]
 
-        data = pickle.dumps(meta)
-        size_tensor = torch.tensor([len(data)], dtype=torch.long, device=self.device)
-        data_tensor = torch.frombuffer(bytearray(data), dtype=torch.uint8).to(self.device)
+        for i, (peer, chunk) in enumerate(zip(self.peer_ranks, kv_chunks)):
+            chunk = chunk.contiguous()
 
-        # 三个 isend 一次性发出，NCCL 保证同一 (src, dst) 对的消息有序到达
-        h_size = dist.isend(size_tensor, dst=self.peer_rank)
-        h_meta = dist.isend(data_tensor, dst=self.peer_rank)
-        h_kv = dist.isend(kv_data, dst=self.peer_rank)
+            if self.is_primary:
+                # 只有 primary 向 peer 发 meta
+                meta = {
+                    'request_id': request.request_id,
+                    'input_ids': request.input_ids,
+                    'generated_ids': list(request.generated_ids),
+                    'max_new_tokens': request.max_new_tokens,
+                    'temperature': request.temperature,
+                    'top_p': request.top_p,
+                    'seq_len': request.kv_cache.seq_len,
+                    'kv_shape': list(chunk.shape),
+                }
+                data = pickle.dumps(meta)
+                size_tensor = torch.tensor([len(data)], dtype=torch.long, device=self.device)
+                data_tensor = torch.frombuffer(bytearray(data), dtype=torch.uint8).to(self.device)
 
-        # 持有 tensor 引用，防止被 GC 回收（isend 是异步的，tensor 必须活着）
-        self.pending_sends.append({
-            'handles': [h_size, h_meta, h_kv],
-            'tensors': [size_tensor, data_tensor, kv_data],  # 防止 GC
-        })
+                h_size = dist.isend(size_tensor, dst=peer)
+                h_meta = dist.isend(data_tensor, dst=peer)
+                h_kv = dist.isend(chunk, dst=peer)
+                self.pending_sends.append({
+                    'handles': [h_size, h_meta, h_kv],
+                    'tensors': [size_tensor, data_tensor, chunk],
+                })
+            else:
+                # 非 primary （多对一时的副 P rank）：只发 kv
+                h_kv = dist.isend(chunk, dst=peer)
+                self.pending_sends.append({
+                    'handles': [h_kv],
+                    'tensors': [chunk],
+                })
 
     def send_done(self):
-        """发送终止信号（size=0），也是异步的"""
-        size_tensor = torch.tensor([0], dtype=torch.long, device=self.device)
-        h = dist.isend(size_tensor, dst=self.peer_rank)
-        self.pending_sends.append({
-            'handles': [h],
-            'tensors': [size_tensor],
-        })
+        if not self.is_primary:
+            self._done_signal_sent = True
+            return
+
+        for peer in self.peer_ranks:
+            size_tensor = torch.tensor([0], dtype=torch.long, device=self.device)
+            h = dist.isend(size_tensor, dst=peer)
+            self.pending_sends.append({
+                'handles': [h],
+                'tensors': [size_tensor],
+            })
         self._done_signal_sent = True
 
     # =========================================================
@@ -309,13 +342,14 @@ class AsyncKVTransfer(KVTransferBase):
         while True:
             progress = False
 
+            # 阶段 0 → 1：从 primary peer 收 size
             if self._state == RecvState.IDLE:
                 self._size_buf.zero_()
-                self._size_handle = dist.irecv(self._size_buf, src=self.peer_rank)
+                self._size_handle = dist.irecv(self._size_buf, src=self.peer_ranks[0])
                 self._state = RecvState.WAIT_SIZE
-                # 刚挂上，不可能立刻完成，break
                 break
 
+            # 阶段 1 → 2：从 primary peer 收 meta
             if self._state == RecvState.WAIT_SIZE:
                 if not self._size_handle.is_completed():
                     break
@@ -325,24 +359,42 @@ class AsyncKVTransfer(KVTransferBase):
                     self._state = RecvState.IDLE
                     return
                 self._meta_buf = torch.zeros(size, dtype=torch.uint8, device=self.device)
-                self._meta_handle = dist.irecv(self._meta_buf, src=self.peer_rank)
+                self._meta_handle = dist.irecv(self._meta_buf, src=self.peer_ranks[0])
                 self._state = RecvState.WAIT_META
                 progress = True
 
+            # 阶段 2 → 3：解析 meta，然后挂 ALL peers 的 kv irecv
             if self._state == RecvState.WAIT_META:
                 if not self._meta_handle.is_completed():
                     break
                 self._current_meta = pickle.loads(self._meta_buf.cpu().numpy().tobytes())
                 kv_shape = self._current_meta['kv_shape']
-                self._kv_buf = torch.empty(kv_shape, dtype=self.dtype, device=self.device)
-                self._kv_handle = dist.irecv(self._kv_buf, src=self.peer_rank)
+
+                # 为每个 peer 分配一个 kv buffer 并挂 irecv
+                self._kv_bufs = []
+                self._kv_handles = []
+                for peer in self.peer_ranks:
+                    buf = torch.empty(kv_shape, dtype=self.dtype, device=self.device)
+                    handle = dist.irecv(buf, src=peer)
+                    self._kv_bufs.append(buf)
+                    self._kv_handles.append(handle)
+
                 self._state = RecvState.WAIT_KV
                 progress = True
 
+            # 阶段 3 → 0：等所有 peer 的 kv 都到齐，cat，scatter
             if self._state == RecvState.WAIT_KV:
-                if not self._kv_handle.is_completed():
+                if not all(h.is_completed() for h in self._kv_handles):
                     break
-                cache = self._scatter_kv_cache(self._kv_buf, self._current_meta['seq_len'])
+
+                # 单 peer：直接用
+                if len(self._kv_bufs) == 1:
+                    kv_data = self._kv_bufs[0]
+                else:
+                    # 多 peer：沿 head 维度 cat
+                    kv_data = torch.cat(self._kv_bufs, dim=3)
+
+                cache = self._scatter_kv_cache(kv_data, self._current_meta['seq_len'])
                 request = Request(
                     request_id=self._current_meta['request_id'],
                     input_ids=self._current_meta['input_ids'],
@@ -353,12 +405,13 @@ class AsyncKVTransfer(KVTransferBase):
                 )
                 request.generated_ids = self._current_meta['generated_ids']
                 self.completed_requests.append(request)
+
                 self._meta_buf = None
-                self._kv_buf = None
+                self._kv_bufs = None
+                self._kv_handles = None
                 self._current_meta = None
                 self._state = RecvState.IDLE
                 progress = True
-                # 回到 IDLE，继续循环，尝试接收下一个
 
             if not progress:
                 break

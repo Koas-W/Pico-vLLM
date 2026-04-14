@@ -26,11 +26,11 @@ def main():
     if rank in p_ranks:
         role = "p"
         tp_rank = p_ranks.index(rank)
-        peer_rank = d_ranks[tp_rank]    # P rank 0 → D rank 2
+        peer_ranks = [d_ranks[tp_rank]]    # P rank 0 → D rank 2
     else:
         role = "d"
         tp_rank = d_ranks.index(rank)
-        peer_rank = p_ranks[tp_rank]    # D rank 2 → P rank 0
+        peer_ranks = [p_ranks[tp_rank]]    # D rank 2 → P rank 0
 
     # 创建 TP 子组（所有 rank 都要参与 new_group 调用，即使自己不在组内）
     p_tp_group = dist.new_group(p_ranks)
@@ -57,21 +57,25 @@ def main():
         model=model, tokenizer=tokenizer, block_manager=bm,
         cache_cls=PagedKVCache, device=device,
         use_cuda_graph=True,
-        tp_size=tp_size, rank=rank, peer_rank=peer_rank,
+        local_tp_size=tp_size, rank=rank, peer_ranks=peer_ranks,
     )
 
     # 提交请求
     engine.submit("The capital of France is", max_new_tokens=20, temperature=1, top_p=0.9)
-    engine.submit("He raped her with his big", max_new_tokens=20, temperature=1, top_p=0.9)
-    engine.submit("Do you know that", max_new_tokens=20, temperature=1, top_p=0.9)
+    engine.submit("He kiss her with love", max_new_tokens=20, temperature=1, top_p=0.9)
+    engine.submit("Do you know that aging means", max_new_tokens=20, temperature=1, top_p=0.9)
 
     # 运行直到完成
+    flag=0
+    num_requests=3
     while True:
         completed = engine.step()
         for req_id, text in completed:
             if rank == 0:
                 print(f"[Request {req_id}] {text}")
         if completed:
+            flag+=completed.__len__()
+        if flag>=num_requests:
             break
 
     print(f"[Rank {rank}] generation done", flush=True)

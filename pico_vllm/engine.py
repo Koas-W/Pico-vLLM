@@ -16,11 +16,13 @@ class Engine:
                  cache_kwargs: dict|None = None, device='cuda',
                  use_cuda_graph=True,   # 是否启用 CUDA Graph，启用后要求 batch size 固定为 max_batch_size
                  max_batch_size=8,      # ← CUDA Graph 需要固定 batch size,
-                 tp_size=1, 
                  rank=0,
-                 peer_rank=0,
+                 peer_ranks:list[int]=[0],
+                 local_tp_size: int = 1,      # 本侧并行度
+                 remote_tp_size: int = 1,     # 对侧并行度
+                 is_primary: bool = True,     # 负责元数据meta传输的主要实例
                  role:str="pd",
-                 manual_seed=42
+                 manual_seed=42,
                  ):
         self.model = model.to(device)
         # self.sampler = sampler
@@ -41,21 +43,23 @@ class Engine:
         self.eos_token_id = tokenizer.eos_token_id
 
         ### tp 并行相关设置 ###
-        self.tp_size = tp_size
+        self.local_tp_size = local_tp_size
         self.rank = rank
-        if tp_size > 1:
+        if local_tp_size > 1:
             torch.manual_seed(manual_seed)
             torch.cuda.manual_seed(manual_seed)
         
         ### PD 分离相关设置 ###
         self.role = role
-        self.peer_rank = peer_rank
+        self.peer_ranks = peer_ranks
         #peer_rank是需要自身rank向其传递KV cache的相应rank
         if self.role == "p":
-            self.transfer = AsyncKVTransfer(local_rank=rank, peer_rank=peer_rank, device=device,
+            self.transfer = AsyncKVTransfer(local_rank=rank, peer_ranks=peer_ranks, device=device,
+                                            local_tp_size=local_tp_size,remote_tp_size=remote_tp_size,is_primary=is_primary,
                                             block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,role=role,)
         elif self.role == "d":
-            self.transfer = AsyncKVTransfer(local_rank=rank, peer_rank=peer_rank, device=device,
+            self.transfer = AsyncKVTransfer(local_rank=rank, peer_ranks=peer_ranks, device=device,
+                                            local_tp_size=local_tp_size,remote_tp_size=remote_tp_size,is_primary=is_primary,
                                             block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,role=role,)
         else:
             # self.transfer = None  # role="pd" 不需要传输层
