@@ -48,6 +48,11 @@ class BlockManager:
             (pagedblocktype.NONE, -1) for i in range(self.num_total_blocks)
         ]
         self.logical_free_blocks: deque[int] = deque(range(self.num_total_blocks))  # 逻辑块索引，初始全部空闲
+
+
+        ######### prefix caching 相关 #########
+        self.gpu_block_ref_count = [0] * num_gpu_blocks
+        self.cpu_block_ref_count = [0] * num_cpu_blocks
     
     def allocate(self, num_blocks: int = 1) -> List[int]:
         # 分配 num_blocks 个物理块
@@ -59,11 +64,13 @@ class BlockManager:
                 physical_block_id = self.gpu_free_blocks.popleft()
                 logical_block_id = self.logical_free_blocks.popleft()
                 self.block_mapping[logical_block_id] = (pagedblocktype.GPU, physical_block_id)
+                self.gpu_block_ref_count[physical_block_id] = 1 # 增加1引用计数
                 block_ids.append(logical_block_id)
             elif self.cpu_free_blocks:
                 physical_block_id = self.cpu_free_blocks.popleft()
                 logical_block_id = self.logical_free_blocks.popleft()
                 self.block_mapping[logical_block_id] = (pagedblocktype.CPU, physical_block_id)
+                self.cpu_block_ref_count[physical_block_id] = 1 # 增加1引用计数
                 block_ids.append(logical_block_id)
             else:
                 raise RuntimeError("No free blocks available")
@@ -77,14 +84,35 @@ class BlockManager:
             block_type, physical_block_id = self.block_mapping[block_id]
             if block_type == pagedblocktype.GPU:
                 self.gpu_free_blocks.append(physical_block_id)
+                # 归零物理块的引用计数（应该已经归零，注释了）
+                # self.gpu_block_ref_count[physical_block_id] = 0
             elif block_type == pagedblocktype.CPU:
                 self.cpu_free_blocks.append(physical_block_id)
+                # self.cpu_block_ref_count[physical_block_id] = 0
             else:
                 raise RuntimeError(f"Block {block_id} is not allocated")
             # 更新 block_mapping
             self.logical_free_blocks.append(block_id)
             self.block_mapping[block_id] = (pagedblocktype.NONE, -1)
 
+    #####################################################
+    # Prefix Caching 需要的引用技术相关操作
+    #####################################################
+    def inc_ref(self, block_ids: list[int]):
+        for bid in block_ids:
+            self.gpu_block_ref_count[bid] += 1
+
+    def dec_ref(self, block_ids: list[int]):
+        """引用降到 0 时 block 立即回收"""
+        to_free_blocks:list[int] = []
+        for bid in block_ids:
+            self.gpu_block_ref_count[bid] -= 1
+            assert self.gpu_block_ref_count[bid] >= 0
+            if self.gpu_block_ref_count[bid] == 0:
+                to_free_blocks.append(bid)
+        
+        self.free(to_free_blocks)
+    
     #####################################################
     # 非必须的方法，用于offload到CPU，swap_in/swap_out()
     #####################################################

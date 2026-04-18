@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from cache import KVCache, NaiveKVCache, PagedKVCache
-from Attention import paged_decode_attention
+from Attention import paged_decode_attention, paged_prefill_attention
 from store_kvcache import store_kvcache
 from RMSNorm import FastRMSNorm
 from SwiGLU import fused_swiglu
@@ -151,19 +151,38 @@ class GQAAttention(nn.Module):
             bias=True
         )
 
-    def _prefill_attention(self, q: Tensor, k: Tensor, v: Tensor):
+    # def _prefill_attention(self, q: Tensor, k: Tensor, v: Tensor):
         
-        # SDPA（B=1，标准 causal attention）
-        # q/k/v: (B, seq, n_heads, head_dim) → 转成 SDPA 期望的格式
-        q = q.transpose(1, 2)  # (B, n_heads, seq, head_dim)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        k = k.repeat_interleave(self.cfg.num_kv_groups, dim=1)
-        v = v.repeat_interleave(self.cfg.num_kv_groups, dim=1)
+    #     # SDPA（B=1，标准 causal attention）
+    #     # q/k/v: (B, seq, n_heads, head_dim) → 转成 SDPA 期望的格式
+    #     q = q.transpose(1, 2)  # (B, n_heads, seq, head_dim)
+    #     k = k.transpose(1, 2)
+    #     v = v.transpose(1, 2)
+    #     k = k.repeat_interleave(self.cfg.num_kv_groups, dim=1)
+    #     v = v.repeat_interleave(self.cfg.num_kv_groups, dim=1)
         
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        # (B, n_heads, seq, head_dim) → (B, seq, hidden)
-        return out.transpose(1, 2).contiguous().view(q.shape[0], -1, self.local_hidden)
+    #     out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    #     # (B, n_heads, seq, head_dim) → (B, seq, hidden)
+    #     return out.transpose(1, 2).contiguous().view(q.shape[0], -1, self.local_hidden)
+    def _prefill_attention(self, q, kv_cache_k, kv_cache_v,
+                        block_table, context_lens, new_token_lens, q_start_loc):
+        """
+        q: (B, seq_len, n_heads, head_dim)  （目前 B=1）
+        kv_cache_k/v: 已经写入 cache
+        
+        新接口：调用 paged_prefill_attention
+        """
+        B, seq_len, _, _ = q.shape
+        # 打平成 (total_tokens, n_heads, head_dim)
+        q_flat = q.reshape(B * seq_len, self.cfg.local_num_attention_heads, self.cfg.head_dim)
+        
+        out = paged_prefill_attention(
+            q_flat, kv_cache_k, kv_cache_v,
+            block_table, context_lens, new_token_lens, q_start_loc,
+            MAX_BLOCKS_PER_SEQ=block_table.shape[1],
+        )
+        # 恢复 (B, seq_len, local_hidden)
+        return out.reshape(B, seq_len, self.local_hidden)
 
     def _decode_attention(self, q, kv_cache_k, kv_cache_v, block_table, context_lens):
         # 直接从 cache 读，不再需要 k/v 参数
@@ -187,6 +206,8 @@ class GQAAttention(nn.Module):
                 is_prefill: bool,
                 block_table: Tensor | None = None,   # (B, max_blocks) int32，物理块id
                 context_lens: Tensor | None = None,  # (B,) int32，每个请求当前长度
+                new_token_lens: Tensor | None = None,  # (B,) int32，每个请求需要新计算kv的token数
+                q_start_loc: Tensor | None = None,  # (B,) int32，每个请求q开始的位置
                 ) -> Tensor:                  # (B, seq_len, hidden_size)
         B, seq_len, _ = x.shape
         qkv = self.qkv_proj(x)  # (B, seq, q_size + k_size + v_size)
@@ -209,7 +230,8 @@ class GQAAttention(nn.Module):
         store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
 
         if is_prefill:
-            output = self._prefill_attention(q, k, v)
+            output = self._prefill_attention(q, kv_cache_k, kv_cache_v,
+                    block_table, context_lens, new_token_lens, q_start_loc)
         else:
             output = self._decode_attention(q, kv_cache_k, kv_cache_v, block_table, context_lens)
 
@@ -226,6 +248,8 @@ class GQAAttention(nn.Module):
                 slot_mapping: Tensor,
                 block_table: Tensor | None = None,   # (B, max_blocks) int32，物理块id
                 context_lens: Tensor | None = None,  # (B,) int32，每个请求当前长度
+                new_token_lens: Tensor | None = None,  # (B,) int32，每个请求需要新计算kv的token数
+                q_start_loc: Tensor | None = None,  # (B,) int32，每个请求q开始的位置
                 ) -> Tensor:                  # (B, seq_len, hidden_size)
         B, seq_len, _ = x.shape
         qkv = self.qkv_proj(x)  # (B, seq, q_size + k_size + v_size)
@@ -248,7 +272,8 @@ class GQAAttention(nn.Module):
         # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
         store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
 
-        output = self._prefill_attention(q, k, v)
+        output = self._prefill_attention(q, kv_cache_k, kv_cache_v,
+                    block_table, context_lens, new_token_lens, q_start_loc)
 
         output = self.o_proj(output)
         if self.cfg.tp_size > 1:
@@ -354,6 +379,8 @@ class TransformerBlock(nn.Module):
                 is_prefill: bool,
                 block_table: Tensor | None = None,
                 context_lens: Tensor | None = None,
+                new_token_lens: Tensor | None = None,
+                q_start_loc: Tensor | None = None,
                 ):
         attn_out = self.attn(
             self.norm1(x), cos, sin,
@@ -363,6 +390,8 @@ class TransformerBlock(nn.Module):
             is_prefill=is_prefill,
             block_table=block_table,
             context_lens=context_lens,
+            new_token_lens=new_token_lens,
+            q_start_loc=q_start_loc,
         )
         x = x + attn_out
         x = x + self.ffn(self.norm2(x))
@@ -411,6 +440,8 @@ class Qwen25_15B(nn.Module):
             is_prefill: bool,
             block_table: Tensor | None = None,   # decode: (B, MAX_BLOCKS)
             context_lens: Tensor | None = None,  # decode: (B,)
+            new_token_lens: Tensor | None = None,
+            q_start_loc: Tensor | None = None,
             ) -> Tensor:
         
         x = self.embed_tokens(input_ids)
@@ -427,6 +458,8 @@ class Qwen25_15B(nn.Module):
                 is_prefill=is_prefill,
                 block_table=block_table,
                 context_lens=context_lens,
+                new_token_lens=new_token_lens,
+                q_start_loc=q_start_loc,
             )
         x = self.norm(x)
         return F.linear(x, self.embed_tokens.weight)

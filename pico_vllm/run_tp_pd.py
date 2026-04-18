@@ -61,13 +61,34 @@ def main():
     )
 
     # 提交请求
-    engine.submit("The capital of France is", max_new_tokens=20, temperature=1, top_p=0.9)
-    engine.submit("He kiss her with love", max_new_tokens=20, temperature=1, top_p=0.9)
-    engine.submit("Do you know that aging means", max_new_tokens=20, temperature=1, top_p=0.9)
+    engine.submit("The capital of France is", max_new_tokens=20, temperature=0, top_p=1.0)
+    engine.submit("He kiss her with love", max_new_tokens=20, temperature=0, top_p=1.0)
+    engine.submit("Do you know that aging means", max_new_tokens=20, temperature=0, top_p=1.0)
+    engine.submit("The capital of France is Paris. The capital of the United States is Washington, D.C. The capital of Canada is Ottawa. The capital of Australia is Canberra.", max_new_tokens=20, temperature=0, top_p=1.0)
+    engine.submit("The capital of France is Paris. The capital of the United States is Washington, D.C. The capital of Canada is Ottawa. The capital of Australia is Canberra.", max_new_tokens=20, temperature=0, top_p=1.0)
+    engine.submit("The capital of France is Paris. The capital of the United States is Washington, D.C. The capital of Canada is Ottawa. The capital of Australia is Canberra.", max_new_tokens=20, temperature=0, top_p=1.0)
+    # engine.submit("The capital of France is", max_new_tokens=20, temperature=1, top_p=0.9)
+    # engine.submit("He kiss her with love", max_new_tokens=20, temperature=1, top_p=0.9)
+    # engine.submit("Do you know that aging means", max_new_tokens=20, temperature=1, top_p=0.9)
 
     # 运行直到完成
     flag=0
-    num_requests=3
+    num_requests=5
+    while True:
+        completed = engine.step()
+        for req_id, text in completed:
+            if rank == 0:
+                print(f"[Request {req_id}] {text}")
+        if completed:
+            flag+=completed.__len__()
+        if flag>=num_requests:
+            break
+
+    engine.submit("The capital of France is Paris. The capital of the United States is Washington, D.C. The capital of Canada is Ottawa. The capital of Australia is Canberra.", max_new_tokens=20, temperature=0, top_p=1.0)
+
+    # 运行直到完成
+    flag=0
+    num_requests=1
     while True:
         completed = engine.step()
         for req_id, text in completed:
@@ -87,6 +108,10 @@ def main():
             torch.cuda.synchronize()
         dist.destroy_process_group()
         print(f"[Rank {rank}] destroyed process group", flush=True)
+
+    if rank == 0 and engine.prefix_cache:
+        print(f"Prefix cache: {engine.prefix_cache.stats}")
+        print(f"Hit rate: {engine.prefix_cache.hit_rate():.1%}")
 
 if __name__ == "__main__":
     main()

@@ -22,6 +22,7 @@ class Engine:
                  remote_tp_size: int = 1,     # 对侧并行度
                  is_primary: bool = True,     # 负责元数据meta传输的主要实例
                  role:str="pd",
+                 enable_prefix_cache=True,
                  manual_seed=42,
                  ):
         self.model = model.to(device)
@@ -72,6 +73,15 @@ class Engine:
         self.use_cuda_graph = use_cuda_graph
         self.max_batch_size = max_batch_size
         
+        # 创建 PrefixCache（所有 role 都可以用，PD 分离下 P 和 D 各有自己的）
+        if enable_prefix_cache:
+            from radix_tree import KVCacheRadixTree
+            from prefix_cache import PrefixCache
+            self.radix_tree = KVCacheRadixTree(block_manager.block_size)
+            self.prefix_cache = PrefixCache(self.radix_tree, block_manager)
+        else:
+            self.prefix_cache = None
+
         # CUDA Graph 只在有 decode 职责时 build
         if use_cuda_graph and role in ("d", "pd"):
             self._build_cuda_graph()
@@ -232,9 +242,31 @@ class Engine:
             # 如果已经完成，返回-1
             if self.no_more_requests:
                 return -1
+            
             # 转成 list 存储
             input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device).tolist()[0]
-            request = self.scheduler.create_request(input_ids, max_new_tokens, temperature, top_p, self.kv_cache_cls, self.kv_cache_kwargs)
+
+            request = self.scheduler.create_request(input_ids, max_new_tokens, temperature, top_p,
+                                                     self.kv_cache_cls, self.kv_cache_kwargs)
+            
+
+            # prefix match 过程
+            if self.prefix_cache is not None:
+                block_size = self.block_manager.block_size
+                # 限制最大匹配长度：至少保留 1 个 token 做 prefill
+                # 对齐到 block_size（完全 block 化版本）
+                max_matchable = ((len(input_ids) - 1) // block_size) * block_size
+
+                if max_matchable > 0:
+                    matched_blocks, matched_len = self.prefix_cache.match(
+                        input_ids[:max_matchable]
+                    )
+                else:
+                    matched_blocks, matched_len = [], 0
+
+                request.matched_blocks = matched_blocks
+                request.matched_len = matched_len
+            
             self.scheduler.add_request(request)
             return request.request_id
     
@@ -258,29 +290,115 @@ class Engine:
 
         # ── prefill：逐个请求，动态形状，不走 graph ──
         for request in prefilling:
-            input_ids = torch.tensor(request.input_ids).unsqueeze(0).to(self.device)
-            kv_cache = request.kv_cache
-            kv_cache._allocate_for_prefill(len(request.input_ids))
-            slot_mapping = kv_cache.get_prefill_slot_mapping(len(request.input_ids))
+            # input_ids = torch.tensor(request.input_ids).unsqueeze(0).to(self.device)
+            # kv_cache = request.kv_cache
+            # kv_cache._allocate_for_prefill(len(request.input_ids))
+            # slot_mapping = kv_cache.get_prefill_slot_mapping(len(request.input_ids))
 
-            start_pos = kv_cache.seq_len
+            # start_pos = kv_cache.seq_len
+            # seq_len = len(request.input_ids)
+            # total_len = start_pos + seq_len
+            # position_ids = torch.arange(
+            #     start_pos, start_pos + len(request.input_ids),
+            #     dtype=torch.long, device=self.device
+            # ).unsqueeze(0)
+
+            # # 准备kv cache和相应的block table
+            # bt = kv_cache.get_block_table()  # (num_blocks,)
+            # block_table = torch.full(
+            #     (1, self.model.cfg.MAX_BLOCKS_PER_SEQ), -1,
+            #     dtype=torch.int32, device=self.device
+            # )
+            # block_table[0, :bt.shape[0]] = bt
+
+            # context_lens = torch.tensor([total_len], dtype=torch.int32, device=self.device)
+            # new_token_lens = torch.tensor([seq_len], dtype=torch.int32, device=self.device)
+            # q_start_loc = torch.tensor([0], dtype=torch.int32, device=self.device)
+
+            # with torch.no_grad():
+            #     logits = self.model(
+            #         input_ids,
+            #         kv_cache_k=self.block_manager.gpu_kv_cache[0],
+            #         kv_cache_v=self.block_manager.gpu_kv_cache[1],
+            #         position_ids=position_ids,
+            #         slot_mapping=slot_mapping,
+            #         is_prefill=True,
+            #         block_table=block_table,
+            #         context_lens=context_lens,
+            #         new_token_lens=new_token_lens,
+            #         q_start_loc=q_start_loc,
+            #     )
+            matched_blocks = request.matched_blocks
+            matched_len = request.matched_len
+
+            # 计算需要新 prefill 的 token
+            new_tokens = request.input_ids[matched_len:]
+            new_len = len(new_tokens)
+            total_len = matched_len + new_len   # = len(request.input_ids)
+
+            kv_cache = request.kv_cache
+
+            # === 关键改动 1：挂载 matched blocks ===
+            if matched_blocks:
+                kv_cache.adopt_blocks(matched_blocks, matched_len)
+            # adopt 后 kv_cache._seq_len = matched_len
+
+            # 为新 token 分配 block（在 matched blocks 之后）
+            kv_cache._allocate_for_prefill(new_len)
+
+            # === 关键改动 2：slot_mapping 从 matched_len 开始 ===
+            slot_mapping = kv_cache.get_prefill_slot_mapping(new_len)
+            # get_prefill_slot_mapping 内部从 _seq_len 开始算，正好是 matched_len
+
+            # === 关键改动 3：position_ids 从 matched_len 开始 ===
             position_ids = torch.arange(
-                start_pos, start_pos + len(request.input_ids),
+                matched_len, total_len,
                 dtype=torch.long, device=self.device
             ).unsqueeze(0)
 
+            # === kernel 参数 ===
+            input_ids_tensor = torch.tensor(new_tokens).unsqueeze(0).to(self.device)
+
+            bt = kv_cache.get_block_table()
+            block_table = torch.full(
+                (1, self.model.cfg.MAX_BLOCKS_PER_SEQ), -1,
+                dtype=torch.int32, device=self.device
+            )
+            block_table[0, :bt.shape[0]] = bt
+
+            context_lens = torch.tensor([total_len], dtype=torch.int32, device=self.device)
+            new_token_lens = torch.tensor([new_len], dtype=torch.int32, device=self.device)
+            q_start_loc = torch.tensor([0], dtype=torch.int32, device=self.device)
+
             with torch.no_grad():
                 logits = self.model(
-                    input_ids,
+                    input_ids_tensor,
                     kv_cache_k=self.block_manager.gpu_kv_cache[0],
                     kv_cache_v=self.block_manager.gpu_kv_cache[1],
                     position_ids=position_ids,
                     slot_mapping=slot_mapping,
                     is_prefill=True,
+                    block_table=block_table,
+                    context_lens=context_lens,
+                    new_token_lens=new_token_lens,
+                    q_start_loc=q_start_loc,
                 )
 
-            kv_cache._seq_len += len(request.input_ids)
+            # 更新 seq_len 到完整长度
+            kv_cache._seq_len = total_len
 
+            # === 关键改动 4：prefill 完成后，插入 prefix cache ===
+            if self.prefix_cache is not None:
+                # 只插入对齐到 block_size 的部分（完全 block 化版本）
+                full_blocks_count = total_len // self.block_manager.block_size
+                if full_blocks_count > 0:
+                    aligned_tokens = request.input_ids[:full_blocks_count * self.block_manager.block_size]
+                    aligned_blocks = kv_cache.physical_block_ids[:full_blocks_count]
+                    self.prefix_cache.insert(aligned_tokens, aligned_blocks)
+
+            # kv_cache._seq_len += len(request.input_ids)
+
+            # 采样首 token
             next_token_id = sampler.sample(logits[:, -1, :], request.temperature, request.top_p)
             request.generated_ids.append(int(next_token_id.item()))
             # print(next_token_id.item())
@@ -288,7 +406,7 @@ class Engine:
             if self.role == "p":
                 self.transfer.send_request(request)
                 # print(f'[Rank 0] sent request id {request.request_id}')
-                request.kv_cache.reset()
+                # request.kv_cache.reset()
                 request.has_finished_notification = True
             elif next_token_id.item() == self.eos_token_id or request.is_max_len_finished():
                 request.has_finished_notification = True
@@ -328,8 +446,45 @@ class Engine:
                         self.tokenizer.decode(request.input_ids + request.generated_ids)
                     ))
 
+        # === 统一释放 FINISHED 请求的资源 ===
+        for request in self.scheduler.finished:
+            if request.request_status == RequestStatus.FINISHED:
+                self._close_request(request)
+        # （可选）清理 CLOSED 的请求
+        # self.scheduler.clear_finished()   # 或者保留用于查询历史
+
         return completed_requests
     
+    def _close_request(self, request: Request):
+        """
+        释放请求持有的所有资源，把状态设为 CLOSED。
+        对所有 role（p/d/pd）和所有场景（正常结束/prefill 失败/被取消）都一样。
+        """
+        if request.request_status == RequestStatus.CLOSED:
+            return  # 幂等
+
+        kv_cache = request.kv_cache
+
+        if self.prefix_cache is not None and kv_cache.seq_len > 0:
+            # 对齐到 block 边界，走 PrefixCache
+            block_size = self.block_manager.block_size
+            full_blocks_count = kv_cache.seq_len // block_size
+            if full_blocks_count > 0:
+                aligned_tokens = (request.input_ids + request.generated_ids)[:full_blocks_count * block_size]
+                self.prefix_cache.release(aligned_tokens)
+
+            # 清理 kv_cache 内部状态（不再调用 BlockManager.free）
+            kv_cache._seq_len = 0
+            kv_cache.allocated_cache_block_num = 0
+            kv_cache.physical_block_ids = []
+            kv_cache.logical_block_ids = []
+            kv_cache.gpu_block_table.fill_(-1)
+        else:
+            # 没有 prefix cache 或请求还没 prefill 过，走原始 reset
+            kv_cache.reset()
+
+        request.request_status = RequestStatus.CLOSED
+
     def is_done(self) -> bool:
         if self.role == "p":
             return self._done_sent and len(self.transfer.pending_sends) == 0

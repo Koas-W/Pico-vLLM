@@ -61,12 +61,6 @@ def Decode_Paged_GQAAttention_Kernel(
         # kv_mask_flat = tl.reshape(kv_mask, (BLOCK_SIZE * HEAD_DIM,))
 
         k_ptrs = k_cache + base + offs_kv
-        # # 运行时打印值（只在 pid=0 时打印，避免刷屏）
-        # if pid_batch == 0 and pid_head == 0:
-        #     tl.device_print("block_idx: ", block_idx)
-        #     tl.device_print("physical_idx: ", physical_idx)
-        #     tl.device_print("base: ", base)
-        #     tl.device_print("context_len: ", context_len)
         # k_block: (block_size, head_dim)
         k_block = tl.load(k_ptrs, mask = kv_token_mask, other=0.0)
         # k_block = tl.zeros((BLOCK_SIZE * HEAD_DIM,), dtype=tl.bfloat16)
@@ -75,13 +69,6 @@ def Decode_Paged_GQAAttention_Kernel(
         v_block = tl.load(v_ptrs, mask = kv_token_mask, other=0.0)
         # v_block = tl.zeros((BLOCK_SIZE * HEAD_DIM,), dtype=tl.bfloat16)
         v_block = tl.reshape(v_block, (BLOCK_SIZE, HEAD_DIM))
-
-        # # 编译期打印类型（不需要运行，编译时就输出）
-        # tl.static_print("physical_idx dtype:", physical_idx.dtype)
-        # tl.static_print("base dtype:", base.dtype)
-        # tl.static_print("k_cache dtype:", k_cache.dtype)
-        # tl.static_print("offs_kv dtype:", offs_kv.dtype)
-        # tl.static_print("k_ptrs dtype:", k_ptrs.dtype)
 
         # mask 最后一个 block 的无效 token
         valid = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE) < context_len
@@ -125,6 +112,151 @@ def paged_decode_attention(q, k_cache, v_cache, block_table, context_lens,
         scale, out,
         MAX_BLOCKS_PER_SEQ=MAX_BLOCKS_PER_SEQ,
         BLOCK_SIZE=BLOCK_SIZE,
+        HEAD_DIM=HEAD_DIM,
+        N_KV_HEAD=N_KV_HEAD,
+        N_HEAD=N_HEAD,
+    )
+    return out
+
+@triton.jit
+def Prefill_Paged_GQAAttention_Kernel(
+    q,                          # (total_new_tokens, n_heads, head_dim)
+    k_cache,                    # (num_blocks, n_kv_heads, block_size, head_dim)
+    v_cache,
+    block_table,                # (B, MAX_BLOCKS_PER_SEQ) int32
+    context_lens,               # (B,) int32，总长度 = prefix_len + new_len
+    new_token_lens,             # (B,) int32，本次 prefill 的新 token 数 M
+    q_start_loc,                # (B,) int32，每个 batch 的 Q 在 q tensor 里的起始 offset
+    scale,
+    out,                        # (total_new_tokens, n_heads, head_dim)
+
+    MAX_BLOCKS_PER_SEQ: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,      # Q tile 大小（一般 = BLOCK_SIZE）
+    HEAD_DIM: tl.constexpr,
+    N_KV_HEAD: tl.constexpr,
+    N_HEAD: tl.constexpr,
+):
+    """
+    Grid: (B, num_q_blocks_max, N_HEAD)
+      num_q_blocks_max = cdiv(max_new_tokens_in_batch, BLOCK_M)
+      超出本 batch 实际 Q 数量的 program 直接 return
+    
+    每个 program 处理：
+      batch pid_batch 的第 pid_q_block 个 Q tile 的 pid_head 头
+      输出一个 (BLOCK_M, HEAD_DIM) 的 tile
+    """
+    pid_batch = tl.program_id(0)
+    pid_q_block = tl.program_id(1)
+    pid_head = tl.program_id(2)
+    kv_head_idx = pid_head // (N_HEAD // N_KV_HEAD)
+
+    # 本 batch 的元数据
+    new_len = tl.load(new_token_lens + pid_batch)         # M
+    total_len = tl.load(context_lens + pid_batch)          # prefix_len + M
+    prefix_len = total_len - new_len
+    q_offset = tl.load(q_start_loc + pid_batch)            # Q 在全局 tensor 里的起始
+
+    # 本 program 负责的 Q tile 范围（在本 batch 的 M 个 Q 里）
+    q_tile_start = pid_q_block * BLOCK_M
+    if q_tile_start >= new_len:
+        return  # 超出本 batch 的 Q，直接退出
+
+    # 初始化 online softmax
+    m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    o_i = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+
+    # 加载 Q tile: (BLOCK_M, HEAD_DIM)
+    q_row_idx = q_offset + q_tile_start + tl.arange(0, BLOCK_M)
+    q_row_mask = tl.arange(0, BLOCK_M) < (new_len - q_tile_start)
+    q_ptrs = q + q_row_idx[:, None] * (N_HEAD * HEAD_DIM) + pid_head * HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
+    q_tile = tl.load(q_ptrs, mask=q_row_mask[:, None], other=0.0)  # (BLOCK_M, HEAD_DIM)
+
+    # Q 在全局序列里的位置（用于 causal mask）
+    q_pos_global = prefix_len + q_tile_start + tl.arange(0, BLOCK_M)  # (BLOCK_M,)
+
+    # 遍历所有 KV block（cache 里已经包含了新写入的 K/V）
+    num_kv_blocks = tl.cdiv(total_len, BLOCK_SIZE)
+
+    for block_idx in range(0, num_kv_blocks):
+        physical_idx = tl.load(block_table + pid_batch * MAX_BLOCKS_PER_SEQ + block_idx)
+        physical_idx = tl.maximum(physical_idx, 0).to(tl.int64)
+        base = physical_idx * N_KV_HEAD * BLOCK_SIZE * HEAD_DIM + kv_head_idx * BLOCK_SIZE * HEAD_DIM
+
+        # 加载 K block: (BLOCK_SIZE, HEAD_DIM)
+        k_token_start = block_idx * BLOCK_SIZE
+        valid_in_block = tl.minimum(BLOCK_SIZE, total_len - k_token_start)
+
+        offs_kv_flat = tl.arange(0, BLOCK_SIZE * HEAD_DIM)
+        kv_token_mask = offs_kv_flat < valid_in_block * HEAD_DIM
+
+        k_ptrs = k_cache + base + offs_kv_flat
+        k_block = tl.load(k_ptrs, mask=kv_token_mask, other=0.0)
+        k_block = tl.reshape(k_block, (BLOCK_SIZE, HEAD_DIM))
+
+        v_ptrs = v_cache + base + offs_kv_flat
+        v_block = tl.load(v_ptrs, mask=kv_token_mask, other=0.0)
+        v_block = tl.reshape(v_block, (BLOCK_SIZE, HEAD_DIM))
+
+        # s = Q @ K^T: (BLOCK_M, BLOCK_SIZE)
+        s = tl.dot(q_tile, tl.trans(k_block))
+        s = s * scale
+
+        # causal mask: q_pos >= k_pos
+        k_pos_global = k_token_start + tl.arange(0, BLOCK_SIZE)  # (BLOCK_SIZE,)
+        valid_k = k_pos_global < total_len                        # block 末尾的无效 token
+        causal = q_pos_global[:, None] >= k_pos_global[None, :]   # (BLOCK_M, BLOCK_SIZE)
+        mask = causal & valid_k[None, :]
+        s = tl.where(mask, s, float('-inf'))
+
+        # online softmax 更新
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])                            # (BLOCK_M, BLOCK_SIZE)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        o_i = o_i * alpha[:, None] + tl.dot(p.to(v_block.dtype), v_block)
+        m_i = m_new
+
+    # 归一化并写回
+    o_i = o_i / l_i[:, None]
+
+    out_ptrs = out + q_row_idx[:, None] * (N_HEAD * HEAD_DIM) + pid_head * HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
+    tl.store(out_ptrs, o_i.to(out.dtype.element_ty), mask=q_row_mask[:, None])
+
+
+@torch.compiler.disable
+def paged_prefill_attention(
+    q,                  # (total_new_tokens, n_heads, head_dim)
+    k_cache, v_cache,
+    block_table,        # (B, MAX_BLOCKS_PER_SEQ)
+    context_lens,       # (B,) 总长度（prefix + new）
+    new_token_lens,     # (B,) 本次 prefill 的 new token 数
+    q_start_loc,        # (B,) Q 在 q tensor 里的起始 offset
+    MAX_BLOCKS_PER_SEQ,
+    BLOCK_SIZE=16,
+    BLOCK_M=16,
+):
+    total_new_tokens, N_HEAD, HEAD_DIM = q.shape
+    N_KV_HEAD = k_cache.shape[1]
+    B = context_lens.shape[0]
+    scale = 1.0 / (HEAD_DIM ** 0.5)
+
+    out = torch.empty_like(q)
+
+    # num_q_blocks_max = 本 batch 中最长的 new_len 对应的 tile 数
+    max_new_len = int(new_token_lens.max().item())
+    num_q_blocks = (max_new_len + BLOCK_M - 1) // BLOCK_M
+
+    grid = (B, num_q_blocks, N_HEAD)
+    Prefill_Paged_GQAAttention_Kernel[grid](
+        q, k_cache, v_cache, block_table,
+        context_lens, new_token_lens, q_start_loc,
+        scale, out,
+        MAX_BLOCKS_PER_SEQ=MAX_BLOCKS_PER_SEQ,
+        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_M=BLOCK_M,
         HEAD_DIM=HEAD_DIM,
         N_KV_HEAD=N_KV_HEAD,
         N_HEAD=N_HEAD,

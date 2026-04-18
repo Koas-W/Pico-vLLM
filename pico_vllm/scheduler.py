@@ -9,7 +9,8 @@ class RequestStatus(Enum):
     WAITING  = "waiting"   # 在 waiting 队列，还没做 prefill
     PREFILL  = "prefill"   # 本步正在做 prefill
     DECODING = "decoding"  # 已经 prefill 完，正在 decode
-    FINISHED = "finished"  # 已完成
+    FINISHED = "finished"  # 已完成，未释放资源
+    CLOSED = "closed"  # 已完成，已在radix tree层面释放资源
 
 ''' 请求对象，包含请求的所有信息和状态
 - request_id: 请求 ID，唯一标识一个请求
@@ -41,6 +42,10 @@ class Request:
         self.top_p = top_p
         self.kv_cache = kv_cache
         self.has_finished_notification = False # engine改变这个状态，scheduler根据这个状态改变 request_status和移出队列
+
+        ###### Prefix Caching 相关字段 ######
+        self.matched_blocks: list[int] = []   # prefix match 命中的 block
+        self.matched_len: int = 0             # 命中的 token 数
 
     def is_max_len_finished(self) -> bool:
         return len(self.generated_ids) >= self.max_new_tokens
