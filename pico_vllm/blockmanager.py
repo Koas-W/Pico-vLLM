@@ -2,7 +2,7 @@ from collections import deque
 from enum import Enum
 import torch
 from torch import dtype
-from typing import Dict, List
+from typing import Dict, List, Callable
 
 class pagedblocktype(Enum):
     GPU = "gpu"
@@ -51,10 +51,23 @@ class BlockManager:
 
 
         ######### prefix caching 相关 #########
-        self.gpu_block_ref_count = [0] * num_gpu_blocks
-        self.cpu_block_ref_count = [0] * num_cpu_blocks
+        self.logical_ref_count = [0] * self.num_total_blocks   # 逻辑块的 ref
+        self._evict_callback = None   # type: Callable[[int], int] | None
+    
+    def set_evict_callback(self, callback):
+        """注册驱逐回调。callback(num_needed) -> num_actually_evicted"""
+        self._evict_callback = callback
     
     def allocate(self, num_blocks: int = 1) -> List[int]:
+        while self.num_free_blocks < num_blocks:
+            needed = num_blocks - self.num_free_blocks
+            evicted_count = self._evict_callback(needed) # type: ignore
+            if evicted_count == 0:
+                break   # 驱逐不出来了，真 OOM
+        
+        if self.num_free_blocks < num_blocks:
+            raise RuntimeError("Block Manager Out Of Memory.")
+
         # 分配 num_blocks 个物理块
         block_ids = []
         if num_blocks > self.num_free_blocks:
@@ -64,13 +77,13 @@ class BlockManager:
                 physical_block_id = self.gpu_free_blocks.popleft()
                 logical_block_id = self.logical_free_blocks.popleft()
                 self.block_mapping[logical_block_id] = (pagedblocktype.GPU, physical_block_id)
-                self.gpu_block_ref_count[physical_block_id] = 1 # 增加1引用计数
+                self.logical_ref_count[logical_block_id] = 1 # 增加1引用计数
                 block_ids.append(logical_block_id)
             elif self.cpu_free_blocks:
                 physical_block_id = self.cpu_free_blocks.popleft()
                 logical_block_id = self.logical_free_blocks.popleft()
                 self.block_mapping[logical_block_id] = (pagedblocktype.CPU, physical_block_id)
-                self.cpu_block_ref_count[physical_block_id] = 1 # 增加1引用计数
+                self.logical_ref_count[logical_block_id] = 1 # 增加1引用计数
                 block_ids.append(logical_block_id)
             else:
                 raise RuntimeError("No free blocks available")
@@ -98,17 +111,17 @@ class BlockManager:
     #####################################################
     # Prefix Caching 需要的引用技术相关操作
     #####################################################
-    def inc_ref(self, block_ids: list[int]):
-        for bid in block_ids:
-            self.gpu_block_ref_count[bid] += 1
+    def inc_ref(self, logical_block_ids: list[int]):
+        for bid in logical_block_ids:
+            self.logical_ref_count[bid] += 1
 
-    def dec_ref(self, block_ids: list[int]):
+    def dec_ref(self, logical_block_ids: list[int]):
         """引用降到 0 时 block 立即回收"""
         to_free_blocks:list[int] = []
-        for bid in block_ids:
-            self.gpu_block_ref_count[bid] -= 1
-            assert self.gpu_block_ref_count[bid] >= 0
-            if self.gpu_block_ref_count[bid] == 0:
+        for bid in logical_block_ids:
+            self.logical_ref_count[bid] -= 1
+            assert self.logical_ref_count[bid] >= 0
+            if self.logical_ref_count[bid] == 0:
                 to_free_blocks.append(bid)
         
         self.free(to_free_blocks)

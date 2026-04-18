@@ -79,6 +79,9 @@ class Engine:
             from prefix_cache import PrefixCache
             self.radix_tree = KVCacheRadixTree(block_manager.block_size)
             self.prefix_cache = PrefixCache(self.radix_tree, block_manager)
+            block_manager.set_evict_callback(
+                lambda n: len(self.prefix_cache.try_evict(n)) # type: ignore
+            )
         else:
             self.prefix_cache = None
 
@@ -257,12 +260,16 @@ class Engine:
                 # 对齐到 block_size（完全 block 化版本）
                 max_matchable = ((len(input_ids) - 1) // block_size) * block_size
 
-                if max_matchable > 0:
-                    matched_blocks, matched_len = self.prefix_cache.match(
-                        input_ids[:max_matchable]
-                    )
-                else:
-                    matched_blocks, matched_len = [], 0
+                # if max_matchable > 0:
+                #     matched_blocks, matched_len = self.prefix_cache.match(
+                #         input_ids[:max_matchable]
+                #     )
+                # else:
+                #     matched_blocks, matched_len = [], 0
+                
+                matched_blocks, matched_len = self.prefix_cache.match(
+                    input_ids[:max_matchable]
+                )
 
                 request.matched_blocks = matched_blocks
                 request.matched_len = matched_len
@@ -393,8 +400,11 @@ class Engine:
                 full_blocks_count = total_len // self.block_manager.block_size
                 if full_blocks_count > 0:
                     aligned_tokens = request.input_ids[:full_blocks_count * self.block_manager.block_size]
-                    aligned_blocks = kv_cache.physical_block_ids[:full_blocks_count]
-                    self.prefix_cache.insert(aligned_tokens, aligned_blocks)
+                    aligned_logical = kv_cache.logical_block_ids[:full_blocks_count]
+                    newly_held = self.prefix_cache.insert(aligned_tokens, aligned_logical)
+                    request.radix_ext_blocks = len(newly_held)     # ← 存下来
+                else:
+                    request.radix_ext_blocks = 0
 
             # kv_cache._seq_len += len(request.input_ids)
 
@@ -468,12 +478,12 @@ class Engine:
         if self.prefix_cache is not None and kv_cache.seq_len > 0:
             # 对齐到 block 边界，走 PrefixCache
             block_size = self.block_manager.block_size
-            full_blocks_count = kv_cache.seq_len // block_size
-            if full_blocks_count > 0:
-                aligned_tokens = (request.input_ids + request.generated_ids)[:full_blocks_count * block_size]
-                self.prefix_cache.release(aligned_tokens)
+            radix_held_len = request.matched_len + request.radix_ext_blocks * block_size
+            radix_path = (request.input_ids + request.generated_ids)[:radix_held_len]
+            held_blocks = list(kv_cache.logical_block_ids)
 
-            # 清理 kv_cache 内部状态（不再调用 BlockManager.free）
+            self.prefix_cache.release(radix_path, held_blocks)
+
             kv_cache._seq_len = 0
             kv_cache.allocated_cache_block_num = 0
             kv_cache.physical_block_ids = []

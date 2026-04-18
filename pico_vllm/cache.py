@@ -176,7 +176,7 @@ class PagedKVCache():
         # 之前：直接 free 所有 block
         # self.block_manager.free(self.logical_block_ids)  # ← 用 logical id
         # 现在：dec_ref，让 BlockManager 决定是否真正释放
-        self.block_manager.dec_ref(self.physical_block_ids)
+        self.block_manager.free(self.logical_block_ids)
         self._seq_len = 0
         self.allocated_cache_block_num = 0
         self.physical_block_ids = []
@@ -184,26 +184,29 @@ class PagedKVCache():
         self.gpu_block_table.fill_(-1)
     
     ####### 和 Prefix Caching 相关逻辑函数 #######
-    def adopt_blocks(self, block_ids: list[int], covered_len: int):
+    def adopt_blocks(self, logical_block_ids: list[int], covered_len: int):
         """
         从 prefix cache 命中接入 block。
         这些 block 的引用已经由 PrefixCache.match() 负责 inc_ref，
         本方法只负责把它们挂进 cache 的 block_table。
         
-        block_ids: 物理 block id 列表
+        block_ids: 逻辑 block id 列表
         covered_len: 这些 block 覆盖了多少 token（应该是 block_size 的整数倍）
         """
         assert covered_len % self.block_size == 0
-        assert len(block_ids) == covered_len // self.block_size
+        assert len(logical_block_ids) == covered_len // self.block_size
         
-        self.physical_block_ids = list(block_ids)
-        self.logical_block_ids = []  # 这些 block 不由本 cache 分配，没有 logical id
-        self.allocated_cache_block_num = len(block_ids)
+        self.logical_block_ids = list(logical_block_ids)
+        # 从 block_manager.block_mapping 查出物理 id
+        self.physical_block_ids = [
+            self.block_manager.block_mapping[lid][1] for lid in logical_block_ids
+        ]
+        self.allocated_cache_block_num = len(self.logical_block_ids)
         self._seq_len = covered_len
         
         # 更新 GPU block table
-        phys_tensor = torch.tensor(block_ids, dtype=torch.int32, device=self.device)
-        self.gpu_block_table[:len(block_ids)] = phys_tensor
+        phys_tensor = torch.tensor(self.physical_block_ids, dtype=torch.int32, device=self.device)
+        self.gpu_block_table[:len(self.physical_block_ids)] = phys_tensor
     
     def release_via_prefix_cache(self, prefix_cache, full_tokens: list[int]):
         """

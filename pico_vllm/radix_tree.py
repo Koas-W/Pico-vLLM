@@ -125,7 +125,7 @@ class KVCacheRadixTree:
                 # 完全匹配了这条边，继续向下遍历
                 i += match_len
                 curr_node = child
-                child.ref_count += 1  # 共享路径增加引用
+                # child.ref_count += 1  # 共享路径增加引用
                 child.update_access_time()
                 # 幂等操作，如果完全匹配已有路径，循环最终会平稳结束，不做任何事
             else:
@@ -210,20 +210,26 @@ class KVCacheRadixTree:
     
     def inc_ref(self, tokens: List[int]) -> None:
         """
-        当一个请求开始使用匹配到的 prefix blocks 时调用。
-        沿匹配路径增加 ref_count。
+        沿 tokens 路径递增 ref_count。
+        只有当 tokens 完整覆盖 child 的 key_tokens 时，才对 child 计数。
+        部分覆盖（tokens 在 edge 中间停下）不计数，此时没有真实的 radix 节点能对应请求的前缀终点。
         """
         curr_node = self.root
         i = 0
         while i < len(tokens):
             if tokens[i] not in curr_node.children:
                 break
-
             child = curr_node.children[tokens[i]]
-            child.update_access_time()
-
+            edge_len = len(child.key_tokens)
+            # 边必须被 tokens 完整覆盖
+            if i + edge_len > len(tokens):
+                break
+            # 且 edge 内容必须和 tokens 对应位置一致（防御：match 保证了这点，此处为严谨性）
+            if child.key_tokens != tokens[i : i + edge_len]:
+                break
             child.ref_count += 1
-            i += len(child.key_tokens)
+            child.update_access_time()
+            i += edge_len
             curr_node = child
             
     def dec_ref(self, tokens: List[int]) -> None:
@@ -242,21 +248,28 @@ class KVCacheRadixTree:
         curr_node = self.root
         i = 0
         while i < len(tokens):
-            if i < len(tokens) and tokens[i] not in curr_node.children:
+            if tokens[i] not in curr_node.children:
                 break
-                
             child = curr_node.children[tokens[i]]
+            edge_len = len(child.key_tokens)
+            if i + edge_len > len(tokens):
+                break
+            if child.key_tokens != tokens[i : i + edge_len]:
+                break
+
             child.ref_count -= 1
-            
+            assert child.ref_count >= 0, (
+                f"ref_count underflow on node with key_tokens={child.key_tokens}"
+            )
+
             if child.ref_count == 0:
                 child.update_access_time()
-                # 只有叶子节点可以直接进入可驱逐队列
-                # 内部节点的回收会由子节点被驱逐时的向上级联触发（见 _remove_node）
                 if child.is_leaf():
-                    # 加入 tuple，id(child) 作为防冲突的 tie-breaker
-                    self.evictable_queue.put((child.last_access_time, id(child), child))
-                    
-            i += len(child.key_tokens)
+                    self.evictable_queue.put(
+                        (child.last_access_time, id(child), child)
+                    )
+
+            i += edge_len
             curr_node = child
 
     def evict(self, num_blocks_needed: int) -> List[int]:
@@ -349,3 +362,10 @@ class KVCacheRadixTree:
                     # 更新孙子节点的父指针
                     for child in parent.children.values():
                         child.parent = parent
+
+                    # merge 后 parent 可能变成 ref=0 的叶子，需要入队
+                    if parent.ref_count == 0 and parent.is_leaf():
+                        parent.update_access_time()
+                        self.evictable_queue.put(
+                            (parent.last_access_time, id(parent), parent)
+                        )
