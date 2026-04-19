@@ -267,12 +267,13 @@ class Engine:
                 # else:
                 #     matched_blocks, matched_len = [], 0
                 
-                matched_blocks, matched_len = self.prefix_cache.match(
+                matched_blocks, matched_len, last_node = self.prefix_cache.match(
                     input_ids[:max_matchable]
                 )
 
                 request.matched_blocks = matched_blocks
                 request.matched_len = matched_len
+                request.last_node = last_node
             
             self.scheduler.add_request(request)
             return request.request_id
@@ -402,9 +403,9 @@ class Engine:
                     aligned_tokens = request.input_ids[:full_blocks_count * self.block_manager.block_size]
                     aligned_logical = kv_cache.logical_block_ids[:full_blocks_count]
                     newly_held = self.prefix_cache.insert(aligned_tokens, aligned_logical)
-                    request.radix_ext_blocks = len(newly_held)     # ← 存下来
-                else:
-                    request.radix_ext_blocks = 0
+                    # request.radix_ext_blocks = len(newly_held)     # ← 存下来
+                # else:
+                    # request.radix_ext_blocks = 0
 
             # kv_cache._seq_len += len(request.input_ids)
 
@@ -476,14 +477,16 @@ class Engine:
         kv_cache = request.kv_cache
 
         if self.prefix_cache is not None and kv_cache.seq_len > 0:
-            # 对齐到 block 边界，走 PrefixCache
-            block_size = self.block_manager.block_size
-            radix_held_len = request.matched_len + request.radix_ext_blocks * block_size
-            radix_path = (request.input_ids + request.generated_ids)[:radix_held_len]
+            # 1. Radix 层：只 dec match 时 inc 过的路径（严格对称）
+            if request.last_node is not self.radix_tree.root:
+                self.radix_tree.dec_lock_ref(request.last_node)
+
+            # 2. Block 层：dec 请求持有的所有 block
             held_blocks = list(kv_cache.logical_block_ids)
+            if held_blocks:
+                self.block_manager.dec_ref(held_blocks)
 
-            self.prefix_cache.release(radix_path, held_blocks)
-
+            # 3. 清理 kv_cache 状态
             kv_cache._seq_len = 0
             kv_cache.allocated_cache_block_num = 0
             kv_cache.physical_block_ids = []

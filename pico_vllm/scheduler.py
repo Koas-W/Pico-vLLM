@@ -3,6 +3,7 @@ import torch
 from typing import List, Optional
 from dataclasses import dataclass
 from cache import KVCache, NaiveKVCache, PagedKVCache
+from radix_tree import KVCacheRadixTreeNode
 
 
 class RequestStatus(Enum):
@@ -31,7 +32,8 @@ class Request:
     kv_cache: PagedKVCache  # 每个请求独享一个 KV cache 实例
     request_status: RequestStatus
     has_eos_token: bool  # 是否已经生成 eos_token，scheduler 不直接接触 tokenizer 和 eos_token_id，这个由 engine 在 decode_step 后更新
-    radix_ext_blocks: int
+    # radix_ext_blocks: int
+    last_node : KVCacheRadixTreeNode
     
     def __init__(self, request_id: int, input_ids: List[int], max_new_tokens: int, temperature: float, top_p: float, kv_cache: PagedKVCache, generated_ids: List[int] | None = None):
         self.request_id = request_id
@@ -43,7 +45,7 @@ class Request:
         self.top_p = top_p
         self.kv_cache = kv_cache
         self.has_finished_notification = False # engine改变这个状态，scheduler根据这个状态改变 request_status和移出队列
-        self.radix_ext_blocks: int = 0
+        # self.radix_ext_blocks: int = 0
 
         ###### Prefix Caching 相关字段 ######
         self.matched_blocks: list[int] = []   # prefix match 命中的 block

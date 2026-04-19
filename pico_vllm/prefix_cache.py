@@ -1,5 +1,5 @@
 from blockmanager import BlockManager
-from radix_tree import KVCacheRadixTree
+from radix_tree import KVCacheRadixTree, KVCacheRadixTreeNode
 
 class PrefixCache:
     """
@@ -14,20 +14,24 @@ class PrefixCache:
             'miss_tokens': 0,
         }
 
-    def match(self, tokens: list[int]) -> tuple[list[int], int]:
+    def match(self, tokens: list[int]) -> tuple[list[int], int, 'KVCacheRadixTreeNode']:
         """
         请求开始，沿 tokens 路径 inc_ref。
         查找 prefix 匹配。命中的 block 自动 inc_ref（防止被驱逐）。
         返回 (matched_block_ids, matched_len)
         """
-        self.stats['match_calls'] += 1 # 仅测试启用
-        blocks, length = self.radix_tree.match(tokens)
+        # self.stats['match_calls'] += 1 # 仅测试启用
+        blocks, length, last_node = self.radix_tree.match_prefix(tokens)
+        # self.stats['hit_tokens'] += length                    # ← 确认存在
+        # self.stats['miss_tokens'] += len(tokens) - length     # ← 确认存在
+        # # ── 临时诊断 ──
+        # print(f"[MATCH] query_len={len(tokens)}, "
+        #     f"tree_children={list(self.radix_tree.root.children.keys())[:3]}, "
+        #     f"matched_len={length}, blocks={len(blocks)}")
         if blocks:
-            self.block_manager.inc_ref(blocks)
-            self.radix_tree.inc_ref(tokens[:length])
-        self.stats['hit_tokens'] += length
-        self.stats['miss_tokens'] += len(tokens) - length
-        return blocks, length
+            self.block_manager.inc_ref(blocks)       # block 层保护
+            self.radix_tree.inc_lock_ref(last_node)  # radix 层保护
+        return blocks, length, last_node             # 返回 node 指针
 
     def insert(self, tokens: list[int], block_ids: list[int]):
         """
@@ -47,15 +51,15 @@ class PrefixCache:
     #     if blocks:
     #         self.radix_tree.dec_ref(tokens[:matched_len])
     #         # self.block_manager.dec_ref(blocks)
-    def release(self, radix_path_tokens: list[int], held_blocks: list[int]):
-        """
-        radix_path_tokens: 这个请求在 radix 上 inc 过 ref 的路径（用来 dec radix 节点的内部 ref）
-        held_blocks: 这个请求在 block_manager 上持有引用的所有 block（= kv_cache.logical_block_ids）
-        """
-        if radix_path_tokens:
-            self.radix_tree.dec_ref(radix_path_tokens)
-        if held_blocks:
-            self.block_manager.dec_ref(held_blocks)
+    # def release(self, radix_path_tokens: list[int], held_blocks: list[int]):
+    #     """
+    #     radix_path_tokens: 这个请求在 radix 上 inc 过 ref 的路径（用来 dec radix 节点的内部 ref）
+    #     held_blocks: 这个请求在 block_manager 上持有引用的所有 block（= kv_cache.logical_block_ids）
+    #     """
+    #     if radix_path_tokens:
+    #         self.radix_tree.dec_ref(radix_path_tokens)
+    #     if held_blocks:
+    #         self.block_manager.dec_ref(held_blocks)
 
     def try_evict(self, num_blocks_needed: int) -> list[int]:
         """
