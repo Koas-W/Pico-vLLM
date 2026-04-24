@@ -18,7 +18,7 @@ class KVCache(ABC):  # 抽象接口
         """当前已缓存的 token 数量"""
         ...
     
-# 朴素实现
+# 朴素实现，已经弃用
 class NaiveKVCache(KVCache):
     # 连续 tensor
     def __init__(self, num_layers, max_seq_len, num_kv_heads, head_dim, device, dtype):
@@ -87,11 +87,11 @@ class PagedKVCache():
         self._seq_len = 0  # 当前已填入的长度
         self._updated_layer = 0 # 当前已填入的layer数量
 
-        # 优化 1：直接缓存 physical_ids 的 Python List，加速标量查询
+        # 直接缓存 physical_ids 的 Python List，加速标量查询
         self.physical_block_ids: List[int] = []
         self.logical_block_ids: List[int] = []
         
-        # 优化 2：在 GPU 上预分配一条完整的 static block table
+        # 在 GPU 上预分配一条完整的 static block table
         self.gpu_block_table = torch.full(
             (self.max_cache_block_num,), -1, dtype=torch.int32, device=self.device
         )

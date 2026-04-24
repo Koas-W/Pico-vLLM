@@ -8,7 +8,7 @@ class PrefixCache:
     def __init__(self, radix_tree:KVCacheRadixTree, block_manager:BlockManager):
         self.radix_tree = radix_tree
         self.block_manager = block_manager
-        self.stats = {
+        self.stats = { #仅用于测试
             'match_calls': 0,
             'hit_tokens': 0,
             'miss_tokens': 0,
@@ -18,7 +18,7 @@ class PrefixCache:
         """
         请求开始，沿 tokens 路径 inc_ref。
         查找 prefix 匹配。命中的 block 自动 inc_ref（防止被驱逐）。
-        返回 (matched_block_ids, matched_len)
+        返回 (matched_block_ids, matched_len, last_fully_matched_node)
         """
         blocks, length, last_node = self.radix_tree.match_prefix(tokens)
         if blocks:
@@ -53,5 +53,6 @@ class PrefixCache:
         return self.radix_tree.match(tokens)
 
     def hit_rate(self):
+        """仅用于测试，性能开销较为明显，目前已经删除实际统计代码"""
         total = self.stats['hit_tokens'] + self.stats['miss_tokens']
         return self.stats['hit_tokens'] / total if total > 0 else 0

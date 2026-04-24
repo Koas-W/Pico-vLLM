@@ -172,6 +172,7 @@ class KVCacheRadixTree:
     def match(self, tokens: list[int]) -> tuple[list[int], int]:
         """
         给定 token 序列，返回最长前缀匹配的 block_ids 和命中的 token 数。
+        仅用于测试，不在真实请求中使用
         
         返回：
           block_ids: 命中的物理 block id 列表（可能为空）
@@ -220,7 +221,7 @@ class KVCacheRadixTree:
 
     def match_prefix(self, tokens: list[int]) -> tuple[list[int], int, 'KVCacheRadixTreeNode']:
         """
-        找最长前缀匹配。
+        找最长前缀匹配。和前面的 match() 函数的区别在于会返回可用的last_node指针
 
         返回:
         matched_blocks: 命中的逻辑 block id 列表
@@ -228,10 +229,10 @@ class KVCacheRadixTree:
         last_node:      最后一个完整匹配的节点指针（用于 inc/dec_lock_ref）
                         如果没有完整匹配任何边，返回 root
 
-        设计要点:
-        - last_node 只在 edge 被完整匹配时更新（保证指针稳定性）
+        match行为:
+        - last_node 只在 edge 被完整匹配时更新
         - 部分匹配的 edge 也能贡献 block（按 block_size 向下取整）
-        - 但部分匹配不更新 last_node（避免锁定可能被分裂的节点）
+        - 部分匹配不更新 last_node
         """
         matched_blocks = []
         last_node = self.root
@@ -340,6 +341,7 @@ class KVCacheRadixTree:
     
     def delete(self, block_id: int) -> None:
         """
+        目前不使用。
         删除包含指定 block_id 的节点（驱逐时调用）。
         删除后如果父节点只剩一个孩子，合并父子节点（保持压缩性质）。
         """
@@ -349,7 +351,7 @@ class KVCacheRadixTree:
             self._remove_node(node)
 
 
-    # --- 内部辅助方法 ---
+    # === 内部辅助方法 ===
     
     def _find_node_with_block(self, node: KVCacheRadixTreeNode, block_id: int) -> KVCacheRadixTreeNode|None:
         if block_id in node.cached_blocks:

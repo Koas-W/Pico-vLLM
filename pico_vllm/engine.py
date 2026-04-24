@@ -256,11 +256,11 @@ class Engine:
                                                      self.kv_cache_cls, self.kv_cache_kwargs)
             
 
-            # prefix match 过程
+            # 在submit的时候，进行一次 prefix match 过程，insert 操作则在 Prefill 结束之后对整个 Prefill 输入序列进行
             if self.prefix_cache is not None:
                 block_size = self.block_manager.block_size
                 # 限制最大匹配长度：至少保留 1 个 token 做 prefill
-                # 对齐到 block_size（完全 block 化版本）
+                # 对齐到 block_size
                 max_matchable = ((len(input_ids) - 1) // block_size) * block_size
 
                 matched_blocks, matched_len, last_node = self.prefix_cache.match(
@@ -275,13 +275,13 @@ class Engine:
             return request.request_id
     
     def mark_finished(self):
-        """告诉 Engine 不会再有新请求提交"""
+        """通知 Engine 不会再有新请求提交"""
         self.no_more_requests = True
     
     def step(self) -> list[tuple[int, str]]:
-        self.transfer.poll()  # NoOpKVTransfer 里是 no-op，不影响 role="pd"
+        self.transfer.poll()  # 如果不启用则是 NoOpKVTransfer，对应操作是 no-op，不影响 role="pd"
 
-        # ── D 侧：先检查有没有新到的请求，在 schedule 之前 ──
+        # === D 侧：检查是否有新到达请求，在 schedule 之前 ===
         if self.role == "d" and not self.transfer.recv_done:
             while True:
                 new_request = self.transfer.try_recv_request()
@@ -292,7 +292,7 @@ class Engine:
         prefilling, decoding = self.scheduler.schedule()
         completed_requests = []
 
-        # ── prefill：逐个请求，动态形状，不走 graph ──
+        # === P 侧：逐个请求处理，动态形状，不使用 cuda graph ===
         for request in prefilling:
             matched_blocks = request.matched_blocks
             matched_len = request.matched_len
@@ -304,7 +304,7 @@ class Engine:
 
             kv_cache = request.kv_cache
 
-            # === 关键改动 1：挂载 matched blocks ===
+            # 挂载 matched block
             if matched_blocks:
                 kv_cache.adopt_blocks(matched_blocks, matched_len)
             # adopt 后 kv_cache._seq_len = matched_len
@@ -312,17 +312,17 @@ class Engine:
             # 为新 token 分配 block（在 matched blocks 之后）
             kv_cache._allocate_for_prefill(new_len)
 
-            # === 关键改动 2：slot_mapping 从 matched_len 开始 ===
+            # slot_mapping 从 matched_len 开始
             slot_mapping = kv_cache.get_prefill_slot_mapping(new_len)
             # get_prefill_slot_mapping 内部从 _seq_len 开始算，正好是 matched_len
 
-            # === 关键改动 3：position_ids 从 matched_len 开始 ===
+            # position_ids 从 matched_len 开始
             position_ids = torch.arange(
                 matched_len, total_len,
                 dtype=torch.long, device=self.device
             ).unsqueeze(0)
 
-            # === kernel 参数 ===
+            # 把输入转化为 Tensor
             input_ids_tensor = torch.tensor(new_tokens).unsqueeze(0).to(self.device)
 
             bt = kv_cache.get_block_table()
@@ -353,7 +353,8 @@ class Engine:
             # 更新 seq_len 到完整长度
             kv_cache._seq_len = total_len
 
-            # === 关键改动 4：prefill 完成后，插入 prefix cache ===
+            # prefill 完成后，插入 prefix cache
+            # 这里的设计逻辑目前是只有 Prefill 阶段和实例会和 prefix cache 相关，Decode 是无关的
             if self.prefix_cache is not None:
                 # 只插入对齐到 block_size 的部分（完全 block 化版本）
                 full_blocks_count = total_len // self.block_manager.block_size
@@ -376,7 +377,7 @@ class Engine:
                     self.tokenizer.decode(request.input_ids + request.generated_ids)
                 ))
 
-        # ── P 侧：所有 prefill 做完且用户标记 no_more_requests，发终止信号 ──
+        # === P 侧：所有 prefill 做完且用户标记 no_more_requests，则发送终止信号 ===
         if (self.role == "p"
             and self.no_more_requests
             and len(self.scheduler.waiting) == 0
@@ -385,7 +386,7 @@ class Engine:
             self.transfer.send_done()
             self._done_sent = True
 
-        # ── decode：batch，走 CUDA Graph 或 eager ──
+        # === D 侧：batch，根据设置走 CUDA Graph 或 eager ===
         if decoding and self.role in ("d", "pd"):
             B = len(decoding)
             kv_caches = [r.kv_cache for r in decoding]
@@ -406,6 +407,7 @@ class Engine:
                     ))
 
         # === 统一释放 FINISHED 请求的资源 ===
+        # 暂时不再使用 Scheduler 的 clear_finished()
         for request in self.scheduler.finished:
             if request.request_status == RequestStatus.FINISHED:
                 self._close_request(request)
@@ -418,12 +420,13 @@ class Engine:
         对所有 role（p/d/pd）和所有场景（正常结束/prefill 失败/被取消）都一样。
         """
         if request.request_status == RequestStatus.CLOSED:
-            return  # 幂等
+            return  # 保证幂等性质
 
         kv_cache = request.kv_cache
 
         if (self.role == "pd" or self.role == "p") and self.prefix_cache is not None and kv_cache.seq_len > 0:
-            # 1. Radix 层：只 dec match 时 inc 过的路径（严格对称）
+            # 1. Radix 层：根据 node 记录，dec match 时 inc 过的路径
+            # 这个策略并不唯一，可以不 dec，同时 evict 做相应调整，允许 evict 计数不为0的node
             if request.last_node is not self.radix_tree.root:
                 self.radix_tree.dec_lock_ref(request.last_node)
 
@@ -439,7 +442,7 @@ class Engine:
             kv_cache.logical_block_ids = []
             kv_cache.gpu_block_table.fill_(-1)
         else:
-            # 没有 prefix cache 或请求还没 prefill 过，走原始 reset
+            # 没有 prefix cache 或请求还没 prefill 过，则走原始 reset
             kv_cache.reset()
 
         request.request_status = RequestStatus.CLOSED

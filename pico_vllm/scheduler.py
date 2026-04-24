@@ -9,7 +9,7 @@ class RequestStatus(Enum):
     PREFILL  = "prefill"   # 本步正在做 prefill
     DECODING = "decoding"  # 已经 prefill 完，正在 decode
     FINISHED = "finished"  # 已完成，未释放资源
-    CLOSED = "closed"  # 已完成，已在radix tree层面释放资源
+    CLOSED   = "closed"    # 已完成，已在 radix tree 层面和 block 层面释放资源
 
 class Request:
     """一个生成请求的所有状态。
@@ -80,7 +80,7 @@ class Scheduler:
     waiting: List[Request]    # 还没开始处理的请求
     prefilling: List[Request]   # 正在 prefill 的请求
     decoding: List[Request]     # 正在 decode 的请求
-    finished: List[Request]   # 已完成的请求
+    finished: List[Request]   # 已完成的请求，会包含 FINISHED 和 CLOSED 两个状态
     def __init__(self, kv_cache_cls: type[PagedKVCache], kv_cache_kwargs={}, _next_request_id: int = 0, max_num_seqs: int = 4):
         self._next_request_id = _next_request_id
         self.max_num_seqs = max_num_seqs
