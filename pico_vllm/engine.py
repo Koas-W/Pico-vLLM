@@ -422,7 +422,7 @@ class Engine:
 
         kv_cache = request.kv_cache
 
-        if self.prefix_cache is not None and kv_cache.seq_len > 0:
+        if (self.role == "pd" or self.role == "p") and self.prefix_cache is not None and kv_cache.seq_len > 0:
             # 1. Radix 层：只 dec match 时 inc 过的路径（严格对称）
             if request.last_node is not self.radix_tree.root:
                 self.radix_tree.dec_lock_ref(request.last_node)
