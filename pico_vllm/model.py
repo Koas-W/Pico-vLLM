@@ -6,11 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from cache import KVCache, NaiveKVCache, PagedKVCache
-from Attention import paged_decode_attention, paged_prefill_attention
-from store_kvcache import store_kvcache
+from kernels.attention import paged_decode_attention, paged_prefill_attention
+from kernels.store_kvcache import store_kvcache
 from RMSNorm import FastRMSNorm
-from SwiGLU import fused_swiglu
-from Fused_RoPE_KVcache_store import fused_decode_rope_and_cache
+from kernels.swiglu import fused_swiglu
+from kernels.fused_rope_kvcache_store import fused_decode_rope_and_cache
 
 @dataclass
 class ModelConfig:

@@ -12,7 +12,7 @@ class KVCacheRadixTreeNode:
     
     children: 指向子节点的指针集合
     value:这个节点对应的逻辑块的id
-    ref_count: 引用技术，只有=0的时候，才可以释放物理块
+    ref_count: 引用计数，用于作为驱逐的优先顺序的参考。在目前的策略下，只有引用计数=0的时候，才可以从树中删除，从而允许释放物理块
     
     """
     def __init__(self, key_tokens: List[int], parent: 'KVCacheRadixTreeNode|None' = None):

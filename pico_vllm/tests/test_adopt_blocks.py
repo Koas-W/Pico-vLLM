@@ -1,3 +1,4 @@
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # test_adopt_blocks.py
 import torch
 from cache import BlockManager, PagedKVCache

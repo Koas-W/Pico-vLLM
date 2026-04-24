@@ -1,7 +1,8 @@
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # test_prefill_paged_attention.py
 import torch
 import torch.nn.functional as F
-from Attention import paged_prefill_attention
+from kernels.attention import paged_prefill_attention
 
 BLOCK_SIZE = 16
 
