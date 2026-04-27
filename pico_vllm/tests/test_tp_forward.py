@@ -1,28 +1,30 @@
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # test_tp_forward.py
 import torch
-import torch.distributed as dist
 import os
 from transformers import AutoTokenizer
 from model import Qwen25_15B, ModelConfig
 from weights import load_weights
 from cache import PagedKVCache, BlockManager
+from comm import create_comm_backend, set_default_comm_backend
 
 def main():
     tp_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    comm_backend = create_comm_backend()
 
     if tp_size > 1:
-        dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
+        comm_backend.init_process_group()
+        set_default_comm_backend(comm_backend)
+        rank = comm_backend.get_rank()
 
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    cfg = ModelConfig(tp_size=tp_size)
+    cfg = ModelConfig(tp_size=tp_size, tp_rank=rank, comm_backend=comm_backend if tp_size > 1 else None)
     model = Qwen25_15B(cfg)
-    model = load_weights(model, "./weights", tp_size=tp_size, rank=rank)
+    model = load_weights(model, "./weights", tp_size=tp_size, tp_rank=rank)
     model = model.to(torch.bfloat16).to(device)
     model.eval()
 
@@ -81,7 +83,7 @@ def main():
         print(f"Next token: {tokenizer.decode([top5.indices[0].item()])}")
 
     if tp_size > 1:
-        dist.destroy_process_group()
+        comm_backend.destroy_process_group()
 
 if __name__ == "__main__":
     main()

@@ -1,7 +1,6 @@
 # model.py
 import torch
 from torch import Tensor
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ from kernels.store_kvcache import store_kvcache
 from RMSNorm import FastRMSNorm
 from kernels.swiglu import fused_swiglu
 from kernels.fused_rope_kvcache_store import fused_decode_rope_and_cache
+from comm import CommBackend, ReduceOp, get_default_comm_backend
 
 @dataclass
 class ModelConfig:
@@ -29,6 +29,7 @@ class ModelConfig:
     tp_size: int = 1
     tp_rank: int = 0
     tp_group: object = None
+    comm_backend: CommBackend | None = None
 
     BLOCK_SIZE = 16 # 目前硬编码为固定值
     MAX_BLOCKS_PER_SEQ = max_position_embeddings // BLOCK_SIZE  # 固定值，启动时确定
@@ -53,6 +54,12 @@ class ModelConfig:
     @property
     def local_intermediate_size(self):
         return self.intermediate_size // self.tp_size
+
+def tp_all_reduce_sum(cfg: ModelConfig, tensor: Tensor) -> None:
+    if cfg.tp_size <= 1:
+        return
+    comm_backend = cfg.comm_backend or get_default_comm_backend()
+    comm_backend.all_reduce(tensor, op=ReduceOp.SUM, group=cfg.tp_group)
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -223,8 +230,7 @@ class GQAAttention(nn.Module):
             output = self._decode_attention(q, kv_cache_k, kv_cache_v, block_table, context_lens)
 
         output = self.o_proj(output)
-        if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
+        tp_all_reduce_sum(self.cfg, output)
         return output
 
     def forward_prefill(self,
@@ -262,8 +268,7 @@ class GQAAttention(nn.Module):
                     block_table, context_lens, new_token_lens, q_start_loc)
 
         output = self.o_proj(output)
-        if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
+        tp_all_reduce_sum(self.cfg, output)
         return output
     
     def forward_decode(self,
@@ -297,8 +302,7 @@ class GQAAttention(nn.Module):
         output = self._decode_attention(q_rot, kv_cache_k, kv_cache_v, block_table, context_lens)
 
         output = self.o_proj(output)
-        if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
+        tp_all_reduce_sum(self.cfg, output)
         return output
     
 class SwiGLUFFN(nn.Module):
@@ -316,8 +320,7 @@ class SwiGLUFFN(nn.Module):
         gate_up = self.gate_up_proj(x)
         gate, up = gate_up.split(self.cfg.local_intermediate_size, dim=-1)
         output = self.down_proj(F.silu(gate) * up)  # (B, seq_len, hidden_size)
-        if self.cfg.tp_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
+        tp_all_reduce_sum(self.cfg, output)
         return output  # (B, seq_len, hidden_size)
 
     def forward_decode(self, x):
@@ -330,8 +333,7 @@ class SwiGLUFFN(nn.Module):
             
             # 3. 再跑一次下采样矩阵乘法
             output = self.down_proj(activated)
-            if self.cfg.tp_size > 1:
-                dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
+            tp_all_reduce_sum(self.cfg, output)
             return output
 
 #############################################################

@@ -1,13 +1,13 @@
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # test_pd_engine.py
 import torch
-import torch.distributed as dist
 import os, sys
 from transformers import AutoTokenizer
 from model import Qwen25_15B, ModelConfig
 from weights import load_weights
 from cache import PagedKVCache, BlockManager
 from engine import Engine
+from comm import create_comm_backend, set_default_comm_backend
 
 def run_single(prompts, max_new_tokens):
     """单卡 role='pd' 对照"""
@@ -56,16 +56,17 @@ def run_single(prompts, max_new_tokens):
 
 def run_pd():
     """双卡 PD 分离"""
-    dist.init_process_group(
-        backend="nccl",
+    comm_backend = create_comm_backend()
+    comm_backend.init_process_group(
         device_id=torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     )
-    rank = dist.get_rank()
+    set_default_comm_backend(comm_backend)
+    rank = comm_backend.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    cfg = ModelConfig()
+    cfg = ModelConfig(comm_backend=comm_backend)
     model = Qwen25_15B(cfg)
     model = load_weights(model, "./weights", tp_rank=rank)
     model = model.to(torch.bfloat16).to(device)
@@ -85,6 +86,7 @@ def run_pd():
         cache_cls=PagedKVCache, device=device,
         use_cuda_graph=(role == "d"),
         tp_size=1, rank=rank, role=role,
+        comm_backend=comm_backend,
     )
 
     prompts = [
@@ -110,13 +112,13 @@ def run_pd():
         for req_id in sorted(results):
             print(f"  [Request {req_id}] {results[req_id]}")
 
-    dist.barrier()
+    comm_backend.barrier()
     if hasattr(engine, 'cuda_graph'):
         del engine.cuda_graph
         if hasattr(engine, 'static_output'):
             del engine.static_output
         torch.cuda.synchronize()
-    dist.destroy_process_group()
+    comm_backend.destroy_process_group()
 
 if __name__ == "__main__":
     mode = sys.argv[-1] if len(sys.argv) > 1 else "single"

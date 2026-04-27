@@ -1,18 +1,21 @@
 # run_tp_pd.py
 import torch
-import torch.distributed as dist
 import os
 from transformers import AutoTokenizer
 from model import Qwen25_15B, ModelConfig
 from weights import load_weights
 from cache import PagedKVCache, BlockManager
 from engine import Engine
+from comm import create_comm_backend, set_default_comm_backend
 
 def main():
-    dist.init_process_group(backend="nccl",
-        device_id=torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}"))
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    comm_backend = create_comm_backend()
+    comm_backend.init_process_group(
+        device_id=torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    )
+    set_default_comm_backend(comm_backend)
+    rank = comm_backend.get_rank()
+    world_size = comm_backend.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
@@ -33,12 +36,12 @@ def main():
         peer_ranks = [p_ranks[tp_rank]]    # D rank 2 → P rank 0
 
     # 创建 TP 子组（所有 rank 都要参与 new_group 调用，即使自己不在组内）
-    p_tp_group = dist.new_group(p_ranks)
-    d_tp_group = dist.new_group(d_ranks)
+    p_tp_group = comm_backend.new_group(p_ranks)
+    d_tp_group = comm_backend.new_group(d_ranks)
     tp_group = p_tp_group if role == "p" else d_tp_group
 
     # === 模型、权重、Engine 初始化 ===
-    cfg = ModelConfig(tp_size=tp_size, tp_rank=tp_rank, tp_group=tp_group)
+    cfg = ModelConfig(tp_size=tp_size, tp_rank=tp_rank, tp_group=tp_group, comm_backend=comm_backend)
     model = Qwen25_15B(cfg)   # 传 tp_group
     model = load_weights(model, "./weights", tp_size=tp_size, tp_rank=tp_rank)
     model = model.to(torch.bfloat16).to(device)
@@ -58,6 +61,7 @@ def main():
         cache_cls=PagedKVCache, device=device,
         use_cuda_graph=True,
         local_tp_size=tp_size, rank=rank, peer_ranks=peer_ranks,
+        comm_backend=comm_backend,
     )
 
     # 提交请求
@@ -101,12 +105,12 @@ def main():
 
     print(f"[Rank {rank}] generation done", flush=True)
     if tp_size > 1:
-        # 释放 CUDA Graph 持有的 NCCL 资源
+        # 释放 CUDA Graph 持有的通信资源
         if engine.use_cuda_graph:
             del engine.cuda_graph
             del engine.static_output
             torch.cuda.synchronize()
-        dist.destroy_process_group()
+        comm_backend.destroy_process_group()
         print(f"[Rank {rank}] destroyed process group", flush=True)
 
     if rank == 0 and engine.prefix_cache:

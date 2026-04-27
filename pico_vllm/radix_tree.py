@@ -1,6 +1,5 @@
 #radix_tree.py
 import torch
-import torch.distributed as dist
 import os, sys
 import time
 from typing import List, Optional, Dict

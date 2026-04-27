@@ -1,21 +1,22 @@
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # test_hetero_tp_pd.py
 import torch
-import torch.distributed as dist
 import os, sys
 from transformers import AutoTokenizer
 from model import Qwen25_15B, ModelConfig
 from weights import load_weights
 from cache import PagedKVCache, BlockManager
 from engine import Engine
+from comm import create_comm_backend, set_default_comm_backend
 
 def main():
-    dist.init_process_group(
-        backend="nccl",
+    comm_backend = create_comm_backend()
+    comm_backend.init_process_group(
         device_id=torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     )
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    set_default_comm_backend(comm_backend)
+    rank = comm_backend.get_rank()
+    world_size = comm_backend.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
@@ -30,8 +31,8 @@ def main():
     # d_ranks = [1, 2]
 
     # 创建 TP 子组（所有 rank 必须参与 new_group 调用）
-    p_tp_group = dist.new_group(p_ranks)
-    d_tp_group = dist.new_group(d_ranks)
+    p_tp_group = comm_backend.new_group(p_ranks)
+    d_tp_group = comm_backend.new_group(d_ranks)
 
     if rank in p_ranks:
         role = "p"
@@ -74,14 +75,14 @@ def main():
     # P2P warmup
     warmup = torch.zeros(1, device=device)
     if rank == 0:
-        dist.send(warmup, dst=2)
-        dist.recv(warmup, src=2)
+        comm_backend.send(warmup, dst=2)
+        comm_backend.recv(warmup, src=2)
     elif rank == 2:
-        dist.recv(warmup, src=0)
-        dist.send(warmup, dst=0)
-    dist.barrier()
+        comm_backend.recv(warmup, src=0)
+        comm_backend.send(warmup, dst=0)
+    comm_backend.barrier()
 
-    cfg = ModelConfig(tp_size=local_tp_size, tp_rank=tp_rank, tp_group=tp_group)
+    cfg = ModelConfig(tp_size=local_tp_size, tp_rank=tp_rank, tp_group=tp_group, comm_backend=comm_backend)
     model = Qwen25_15B(cfg)
     model = load_weights(model, "./weights", tp_size=local_tp_size, tp_rank=tp_rank)
     model = model.to(torch.bfloat16).to(device)
@@ -104,6 +105,7 @@ def main():
         is_primary=is_primary,
         rank=rank, role=role,
         peer_ranks=peer_ranks,
+        comm_backend=comm_backend,
     )
 
     # P 组内所有 rank 提交相同请求
@@ -129,13 +131,13 @@ def main():
         for req_id in sorted(results):
             print(f"  [Request {req_id}] {results[req_id]}")
 
-    dist.barrier()
+    comm_backend.barrier()
     if hasattr(engine, 'cuda_graph'):
         del engine.cuda_graph
         if hasattr(engine, 'static_output'):
             del engine.static_output
         torch.cuda.synchronize()
-    dist.destroy_process_group()
+    comm_backend.destroy_process_group()
 
 
 if __name__ == "__main__":

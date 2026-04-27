@@ -169,8 +169,10 @@ def create_engine(enable_prefix_cache, tp_size, rank, device):
     from cache import PagedKVCache
     from blockmanager import BlockManager
     from engine import Engine
+    from comm import get_default_comm_backend
 
-    cfg = ModelConfig(tp_size=tp_size)
+    comm_backend = get_default_comm_backend() if tp_size > 1 else None
+    cfg = ModelConfig(tp_size=tp_size, tp_rank=rank, comm_backend=comm_backend)
     model = Qwen25_15B(cfg)
     model = load_weights(model, "./weights", tp_size=tp_size, tp_rank=rank)
     model = model.to(torch.bfloat16).to(device)
@@ -193,6 +195,7 @@ def create_engine(enable_prefix_cache, tp_size, rank, device):
         cache_cls=PagedKVCache, device=device,
         use_cuda_graph=True,
         local_tp_size=tp_size, rank=rank,
+        comm_backend=comm_backend,
         enable_prefix_cache=enable_prefix_cache,
     )
 
@@ -249,15 +252,17 @@ def run_one_config(enable_prefix_cache, tp_size, rank, device, label):
 
 
 def main():
-    import torch.distributed as dist
+    from comm import create_comm_backend, set_default_comm_backend
 
     tp_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    comm_backend = create_comm_backend()
 
     if tp_size > 1:
-        dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
+        comm_backend.init_process_group()
+        set_default_comm_backend(comm_backend)
+        rank = comm_backend.get_rank()
 
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
@@ -307,7 +312,7 @@ def main():
                   f"speedup={avg_off/avg_on:.2f}x")
 
     if tp_size > 1:
-        dist.destroy_process_group()
+        comm_backend.destroy_process_group()
 
 
 if __name__ == "__main__":

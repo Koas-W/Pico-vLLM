@@ -1,7 +1,6 @@
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # benchmark_pd.py
 import torch
-import torch.distributed as dist
 import time
 import os
 import sys
@@ -12,10 +11,12 @@ from model import Qwen25_15B, ModelConfig
 from weights import load_weights
 from cache import PagedKVCache, BlockManager
 from engine import Engine
+from comm import CommBackend, create_comm_backend, set_default_comm_backend
 import sampler
 
-def create_engine(device, role="pd", use_cuda_graph=True, tp_size=1, rank=0):
-    cfg = ModelConfig(tp_size=tp_size)
+def create_engine(device, role="pd", use_cuda_graph=True, tp_size=1, rank=0,
+                  comm_backend: CommBackend | None = None):
+    cfg = ModelConfig(tp_size=tp_size, tp_rank=rank, comm_backend=comm_backend)
     model = Qwen25_15B(cfg)
     model = load_weights(model, "./weights", tp_size=tp_size, tp_rank=rank)
     model = model.to(torch.bfloat16).to(device)
@@ -33,6 +34,7 @@ def create_engine(device, role="pd", use_cuda_graph=True, tp_size=1, rank=0):
         cache_cls=PagedKVCache, device=device,
         use_cuda_graph=use_cuda_graph and role in ("d", "pd"),
         tp_size=tp_size, rank=rank, role=role,
+        comm_backend=comm_backend,
     )
     return engine, tokenizer
 
@@ -276,11 +278,12 @@ def run_single():
 
 
 def run_pd():
-    dist.init_process_group(
-        backend="nccl",
+    comm_backend = create_comm_backend()
+    comm_backend.init_process_group(
         device_id=torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     )
-    rank = dist.get_rank()
+    set_default_comm_backend(comm_backend)
+    rank = comm_backend.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
@@ -291,23 +294,24 @@ def run_pd():
         (benchmark_scenario_b, "B"),
         (benchmark_scenario_c, "C"),
     ]:
-        dist.barrier()
+        comm_backend.barrier()
         engine, tokenizer = create_engine(
             device, role=role, use_cuda_graph=(role == "d"),
+            comm_backend=comm_backend,
         )
         
         if role in ("p", "d"):
             warmup = torch.zeros(1, device=device)
             if rank == 0:
-                dist.send(warmup, dst=1)
-                dist.recv(warmup, src=1)
-                dist.isend(warmup, dst=1)
-                dist.irecv(warmup, src=1)
+                comm_backend.send(warmup, dst=1)
+                comm_backend.recv(warmup, src=1)
+                comm_backend.isend(warmup, dst=1)
+                comm_backend.irecv(warmup, src=1)
             else:
-                dist.recv(warmup, src=0)
-                dist.send(warmup, dst=0)
-                dist.isend(warmup, dst=0)
-                dist.irecv(warmup, src=0)
+                comm_backend.recv(warmup, src=0)
+                comm_backend.send(warmup, dst=0)
+                comm_backend.isend(warmup, dst=0)
+                comm_backend.irecv(warmup, src=0)
             torch.cuda.synchronize()
         
         scenario_fn(engine, tokenizer, rank, role, f"PD 分离 ({role})")
@@ -318,9 +322,9 @@ def run_pd():
                 del engine.static_output
         del engine
         torch.cuda.synchronize()
-        dist.barrier()
+        comm_backend.barrier()
 
-    dist.destroy_process_group()
+    comm_backend.destroy_process_group()
 
 
 if __name__ == "__main__":

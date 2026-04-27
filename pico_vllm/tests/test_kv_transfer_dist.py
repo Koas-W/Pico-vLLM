@@ -1,22 +1,24 @@
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # test_kv_transfer_dist.py
 import torch
-import torch.distributed as dist
 import os
 from model import ModelConfig
 from cache import PagedKVCache, BlockManager
 from kv_transfer import SyncKVTransfer
 from scheduler import Request
+from comm import create_comm_backend, set_default_comm_backend
 
 def main():
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
+    comm_backend = create_comm_backend()
+    comm_backend.init_process_group()
+    set_default_comm_backend(comm_backend)
+    rank = comm_backend.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
     dtype = torch.bfloat16
-    cfg = ModelConfig()
+    cfg = ModelConfig(comm_backend=comm_backend)
     BLOCK_SIZE = 16
 
     # 每卡各自的 BlockManager
@@ -36,6 +38,7 @@ def main():
     transfer = SyncKVTransfer(
         local_rank=rank, peer_rank=peer_rank, device=device,
         block_manager=bm, model_cfg=cfg,cache_kwargs=cache_kwargs,
+        comm_backend=comm_backend,
     )
 
     seq_len = 37
@@ -74,8 +77,8 @@ def main():
         print(f"[Rank 0] Send complete")
 
         # 把原始数据发给 rank 1 用于验证
-        dist.send(original_k, dst=1)
-        dist.send(original_v, dst=1)
+        comm_backend.send(original_k, dst=1)
+        comm_backend.send(original_v, dst=1)
 
     else:
         # === Decode 侧：接收 ===
@@ -98,8 +101,8 @@ def main():
             dtype=dtype, device=device,
         )
         original_v = torch.empty_like(original_k)
-        dist.recv(original_k, src=0)
-        dist.recv(original_v, src=0)
+        comm_backend.recv(original_k, src=0)
+        comm_backend.recv(original_v, src=0)
 
         # 对比 KV Cache 数据
         block_table_d = recv_request.kv_cache.get_block_table()
@@ -118,8 +121,8 @@ def main():
 
         recv_request.kv_cache.reset()
 
-    dist.barrier()
-    dist.destroy_process_group()
+    comm_backend.barrier()
+    comm_backend.destroy_process_group()
 
 if __name__ == "__main__":
     main()

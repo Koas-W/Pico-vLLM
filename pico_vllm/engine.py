@@ -4,6 +4,7 @@ from cache import KVCache, NaiveKVCache, PagedKVCache, BlockManager
 import sampler
 from scheduler import RequestStatus, Scheduler, Request
 from kv_transfer import KVTransferBase, SyncKVTransfer, NoOpKVTransfer, AsyncKVTransfer
+from comm import CommBackend, get_default_comm_backend
 import time
 
 class Engine:
@@ -23,9 +24,11 @@ class Engine:
                  rank=0,
                  peer_ranks:list[int]=[0],
                  local_tp_size: int = 1,      # 本侧并行度
+                 tp_size: int | None = None,  # 兼容旧调用名
                  remote_tp_size: int = 1,     # 对侧并行度
                  is_primary: bool = True,     # 负责元数据meta传输的主要实例
                  role:str="pd",
+                 comm_backend: CommBackend | None = None,
                  enable_prefix_cache=True,
                  manual_seed=42,
                  ):
@@ -48,8 +51,15 @@ class Engine:
         self.eos_token_id = tokenizer.eos_token_id
 
         ### tp 并行相关设置 ###
+        if tp_size is not None:
+            local_tp_size = tp_size
         self.local_tp_size = local_tp_size
         self.rank = rank
+        self.comm_backend = comm_backend or getattr(model.cfg, "comm_backend", None)
+        if self.comm_backend is None and (local_tp_size > 1 or role in ("p", "d")):
+            self.comm_backend = get_default_comm_backend()
+        if local_tp_size > 1 and getattr(model.cfg, "comm_backend", None) is None:
+            model.cfg.comm_backend = self.comm_backend
         if local_tp_size > 1:
             torch.manual_seed(manual_seed)
             torch.cuda.manual_seed(manual_seed)
@@ -61,11 +71,13 @@ class Engine:
         if self.role == "p":
             self.transfer = AsyncKVTransfer(local_rank=rank, peer_ranks=peer_ranks, device=device,
                                             local_tp_size=local_tp_size,remote_tp_size=remote_tp_size,is_primary=is_primary,
-                                            block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,role=role,)
+                                            block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,role=role,
+                                            comm_backend=self.comm_backend)
         elif self.role == "d":
             self.transfer = AsyncKVTransfer(local_rank=rank, peer_ranks=peer_ranks, device=device,
                                             local_tp_size=local_tp_size,remote_tp_size=remote_tp_size,is_primary=is_primary,
-                                            block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,role=role,)
+                                            block_manager=block_manager, model_cfg=model.cfg,cache_kwargs=self.kv_cache_kwargs,role=role,
+                                            comm_backend=self.comm_backend)
         else:
             # self.transfer = None  # role="pd" 不需要传输层
             self.transfer = NoOpKVTransfer()  # 类型安全，poll() 和 try_recv 都是 no-op

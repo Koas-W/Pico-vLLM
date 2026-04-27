@@ -1,28 +1,30 @@
 # run_tp.py
 import torch
-import torch.distributed as dist
 import os
 from transformers import AutoTokenizer
 from model import Qwen25_15B, ModelConfig
 from weights import load_weights
 from cache import PagedKVCache, BlockManager
 from engine import Engine
+from comm import create_comm_backend, set_default_comm_backend
 
 def main():
     tp_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    comm_backend = create_comm_backend()
 
     if tp_size > 1:
-        dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
+        comm_backend.init_process_group()
+        set_default_comm_backend(comm_backend)
+        rank = comm_backend.get_rank()
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    cfg = ModelConfig(tp_size=tp_size)
+    cfg = ModelConfig(tp_size=tp_size, tp_rank=rank, comm_backend=comm_backend if tp_size > 1 else None)
     model = Qwen25_15B(cfg)
     model = load_weights(model, "./weights", tp_size=tp_size, tp_rank=rank)
     model = model.to(torch.bfloat16).to(device)
@@ -42,6 +44,7 @@ def main():
         cache_cls=PagedKVCache, device=device,
         use_cuda_graph=True,
         local_tp_size=tp_size, rank=rank,
+        comm_backend=comm_backend if tp_size > 1 else None,
     )
 
     # 提交请求
@@ -58,12 +61,12 @@ def main():
 
     print(f"[Rank {rank}] generation done", flush=True)
     if tp_size > 1:
-        # 释放 CUDA Graph 持有的 NCCL 资源
+        # 释放 CUDA Graph 持有的通信资源
         if engine.use_cuda_graph:
             del engine.cuda_graph
             del engine.static_output
             torch.cuda.synchronize()
-        dist.destroy_process_group()
+        comm_backend.destroy_process_group()
         print(f"[Rank {rank}] destroyed process group", flush=True)
 
 if __name__ == "__main__":

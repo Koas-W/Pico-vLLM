@@ -6,7 +6,6 @@ KV Cache 传输层，负责 PD 分离时的 KV Cache 和请求元数据的跨卡
 
 from enum import Enum
 import torch
-import torch.distributed as dist
 import pickle
 from abc import ABC, abstractmethod
 
@@ -14,6 +13,7 @@ from blockmanager import BlockManager
 from cache import KVCache, PagedKVCache
 from scheduler import Request
 from model import ModelConfig
+from comm import CommBackend, get_default_comm_backend
 
 class RecvState(Enum):
     """一个正在接收的请求的状态机"""
@@ -63,14 +63,24 @@ class NoOpKVTransfer(KVTransferBase):
 class SyncKVTransfer(KVTransferBase):
     """Phase 1：同步阻塞传输"""
     def __init__(self, local_rank, peer_rank, device,
-                 block_manager:BlockManager, model_cfg:ModelConfig, cache_kwargs:dict):
+                 block_manager:BlockManager, model_cfg:ModelConfig, cache_kwargs:dict|None=None,
+                 comm_backend: CommBackend | None = None):
         self.local_rank = local_rank
         self.peer_rank = peer_rank
         self.device = device
         self.block_manager = block_manager
         self.cfg = model_cfg
-        self.cache_kwargs = cache_kwargs
+        self.cache_kwargs = cache_kwargs if cache_kwargs is not None else dict(
+            block_manager=block_manager,
+            num_layers=model_cfg.num_hidden_layers,
+            max_seq_len=4096,
+            num_kv_heads=model_cfg.local_num_key_value_heads,
+            head_dim=model_cfg.head_dim,
+            device=device,
+            dtype=block_manager.dtype,
+        )
         self.dtype = block_manager.dtype
+        self.comm_backend = comm_backend or model_cfg.comm_backend or get_default_comm_backend()
         self.recv_done = False  # decode 侧：P 是否已经发完所有请求
 
     def _gather_kv_cache(self, request: Request) -> torch.Tensor:
@@ -118,13 +128,13 @@ class SyncKVTransfer(KVTransferBase):
         # 发送元数据长度 + 元数据
         data = pickle.dumps(meta)
         size_tensor = torch.tensor([len(data)], dtype=torch.long, device=self.device)
-        dist.send(size_tensor, dst=self.peer_rank)
+        self.comm_backend.send(size_tensor, dst=self.peer_rank)
 
         data_tensor = torch.frombuffer(bytearray(data), dtype=torch.uint8).to(self.device)
-        dist.send(data_tensor, dst=self.peer_rank)
+        self.comm_backend.send(data_tensor, dst=self.peer_rank)
 
         # 发送 KV Cache
-        dist.send(kv_data, dst=self.peer_rank)
+        self.comm_backend.send(kv_data, dst=self.peer_rank)
 
     def try_recv_request(self) -> Request | None:
         """阻塞接收：先收元数据，再收 KV Cache"""
@@ -133,7 +143,7 @@ class SyncKVTransfer(KVTransferBase):
             return None
         # 接收元数据长度
         size_tensor = torch.zeros(1, dtype=torch.long, device=self.device)
-        dist.recv(size_tensor, src=self.peer_rank)
+        self.comm_backend.recv(size_tensor, src=self.peer_rank)
         size = (int)(size_tensor.item())
 
         if size == 0:
@@ -142,7 +152,7 @@ class SyncKVTransfer(KVTransferBase):
 
         # 接收元数据
         data_tensor = torch.zeros(size, dtype=torch.uint8, device=self.device)
-        dist.recv(data_tensor, src=self.peer_rank)
+        self.comm_backend.recv(data_tensor, src=self.peer_rank)
         meta = pickle.loads(data_tensor.cpu().numpy().tobytes())
 
         # 接收 KV Cache
@@ -152,7 +162,7 @@ class SyncKVTransfer(KVTransferBase):
             dtype=self.dtype,
             device=self.device,
         )
-        dist.recv(kv_data, src=self.peer_rank)
+        self.comm_backend.recv(kv_data, src=self.peer_rank)
 
         # 创建 Request
         request = Request(
@@ -170,7 +180,7 @@ class SyncKVTransfer(KVTransferBase):
     def send_done(self):
         """告诉 decode 侧没有更多请求了"""
         size_tensor = torch.tensor([0], dtype=torch.long, device=self.device)
-        dist.send(size_tensor, dst=self.peer_rank)
+        self.comm_backend.send(size_tensor, dst=self.peer_rank)
 
     def poll(self):
         """同步模式下无需 poll"""
@@ -192,6 +202,7 @@ class AsyncKVTransfer(KVTransferBase):
                  dtype=torch.bfloat16, 
                  cache_cls:type[PagedKVCache]=PagedKVCache, 
                  cache_kwargs: dict|None = None, 
+                 comm_backend: CommBackend | None = None,
                  ):
         self.local_rank = local_rank
         self.peer_ranks = peer_ranks
@@ -205,6 +216,7 @@ class AsyncKVTransfer(KVTransferBase):
         self.dtype = dtype
         self.cache_cls = cache_cls
         self.cache_kwargs = cache_kwargs
+        self.comm_backend = comm_backend or model_cfg.comm_backend or get_default_comm_backend()
         self.recv_done = False
         if role == "p":
             self.recv_done = True
@@ -274,16 +286,16 @@ class AsyncKVTransfer(KVTransferBase):
                 size_tensor = torch.tensor([len(data)], dtype=torch.long, device=self.device)
                 data_tensor = torch.frombuffer(bytearray(data), dtype=torch.uint8).to(self.device)
 
-                h_size = dist.isend(size_tensor, dst=peer)
-                h_meta = dist.isend(data_tensor, dst=peer)
-                h_kv = dist.isend(chunk, dst=peer)
+                h_size = self.comm_backend.isend(size_tensor, dst=peer)
+                h_meta = self.comm_backend.isend(data_tensor, dst=peer)
+                h_kv = self.comm_backend.isend(chunk, dst=peer)
                 self.pending_sends.append({
                     'handles': [h_size, h_meta, h_kv],
                     'tensors': [size_tensor, data_tensor, chunk],
                 })
             else:
                 # 非 primary （多对一时的副 P rank）：只发 kv
-                h_kv = dist.isend(chunk, dst=peer)
+                h_kv = self.comm_backend.isend(chunk, dst=peer)
                 self.pending_sends.append({
                     'handles': [h_kv],
                     'tensors': [chunk],
@@ -296,7 +308,7 @@ class AsyncKVTransfer(KVTransferBase):
 
         for peer in self.peer_ranks:
             size_tensor = torch.tensor([0], dtype=torch.long, device=self.device)
-            h = dist.isend(size_tensor, dst=peer)
+            h = self.comm_backend.isend(size_tensor, dst=peer)
             self.pending_sends.append({
                 'handles': [h],
                 'tensors': [size_tensor],
@@ -340,7 +352,7 @@ class AsyncKVTransfer(KVTransferBase):
             # 阶段 0 → 1：从 primary peer 收 size
             if self._state == RecvState.IDLE:
                 self._size_buf.zero_()
-                self._size_handle = dist.irecv(self._size_buf, src=self.peer_ranks[0])
+                self._size_handle = self.comm_backend.irecv(self._size_buf, src=self.peer_ranks[0])
                 self._state = RecvState.WAIT_SIZE
                 break
 
@@ -354,7 +366,7 @@ class AsyncKVTransfer(KVTransferBase):
                     self._state = RecvState.IDLE
                     return
                 self._meta_buf = torch.zeros(size, dtype=torch.uint8, device=self.device)
-                self._meta_handle = dist.irecv(self._meta_buf, src=self.peer_ranks[0])
+                self._meta_handle = self.comm_backend.irecv(self._meta_buf, src=self.peer_ranks[0])
                 self._state = RecvState.WAIT_META
                 progress = True
 
@@ -370,7 +382,7 @@ class AsyncKVTransfer(KVTransferBase):
                 self._kv_handles = []
                 for peer in self.peer_ranks:
                     buf = torch.empty(kv_shape, dtype=self.dtype, device=self.device)
-                    handle = dist.irecv(buf, src=peer)
+                    handle = self.comm_backend.irecv(buf, src=peer)
                     self._kv_bufs.append(buf)
                     self._kv_handles.append(handle)
 

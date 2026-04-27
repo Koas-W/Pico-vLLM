@@ -1,22 +1,24 @@
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # benchmark_tp.py
 import torch
-import torch.distributed as dist
 import time
 import os
 from transformers import AutoTokenizer
 from model import Qwen25_15B, ModelConfig
 from weights import load_weights
 from cache import PagedKVCache, BlockManager
+from comm import create_comm_backend, set_default_comm_backend
 
 def main():
     tp_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    comm_backend = create_comm_backend()
 
     if tp_size > 1:
-        dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
+        comm_backend.init_process_group()
+        set_default_comm_backend(comm_backend)
+        rank = comm_backend.get_rank()
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
@@ -24,9 +26,9 @@ def main():
     torch.cuda.set_device(device)
     dtype = torch.bfloat16
 
-    cfg = ModelConfig(tp_size=tp_size)
+    cfg = ModelConfig(tp_size=tp_size, tp_rank=rank, comm_backend=comm_backend if tp_size > 1 else None)
     model = Qwen25_15B(cfg)
-    model = load_weights(model, "./weights", tp_size=tp_size, rank=rank)
+    model = load_weights(model, "./weights", tp_size=tp_size, tp_rank=rank)
     model = model.to(dtype).to(device)
     model.eval()
 
@@ -163,7 +165,7 @@ def main():
     if tp_size > 1:
         del g, static_output
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        comm_backend.destroy_process_group()
 
 if __name__ == "__main__":
     main()

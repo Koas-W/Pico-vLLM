@@ -10,7 +10,7 @@
 
 **Prefix Caching**：在 vLLM 的 block-level BlockManager 上实现 SGLang 风格的 token-level radix tree。通过实现双层引用计数模型（lock_ref + logical_ref_count），实现驱逐策略和实际缓存释放时机的解耦。实现了 LRU 驱逐策略 + lazy deletion 驱逐实现。在 2000-token 的共享前缀测试场景下下，实现 TTFT 平均 2.56x，峰值 3.45x 的加速比。
 
-**分布式推理**：实现了 Tensor Parallelism + PD 分离（NCCL后端，支持同步/异步模式）。支持异构并行度组合（P(TP=2)+D(TP=1) ，或者反过来），解决跨并行度的 KV head 重映射。通过 PD 分离，实现 ITL 提升 5.2x，tail latency 从 ~50ms 降低到 ~2ms。
+**分布式推理**：实现了 Tensor Parallelism + PD 分离（默认 NCCL，可插拔通信后端，支持同步/异步模式）。支持异构并行度组合（P(TP=2)+D(TP=1) ，或者反过来），解决跨并行度的 KV head 重映射。通过 PD 分离，实现 ITL 提升 5.2x，tail latency 从 ~50ms 降低到 ~2ms。
 
 **性能分析**：完整的 nsys profiling 和跨硬件对比（5090 PCIe vs B200 NVLink）（详情参考[Fain的blog](https://koas-w.github.io/)）。在 Qwen2.5-1.5B 模型的 ~2000 token 请求长度下， CPU overhead 仅占总执行时间 6%。
 
@@ -89,6 +89,8 @@ python run_single.py
 cd pico_vllm/
 torchrun --nproc_per_node=2 run_tp.py
 ```
+
+通信后端通过 `pico_vllm/comm.py` 注册和创建，默认 `PICO_COMM_BACKEND=nccl`。
 
 ### 多卡（4卡）推理入口示例： TP=2 + PD分离
 
