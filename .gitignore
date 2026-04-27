@@ -1,6 +1,8 @@
 pico_vllm/weights/
 pico_vllm/__pycache__/
 pico_vllm/kernels/__pycache__/
+**/trace_*.json
+**/profile_*.json
 venv/
 .vscode/
 .claude/
