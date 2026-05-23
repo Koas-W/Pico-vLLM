@@ -79,7 +79,7 @@ def allocate_blocks_and_store_kv(k_full, v_full, num_gpu_blocks, block_size):
     return k_cache, v_cache, perm
 
 
-def test_case(name, B, new_lens, prefix_lens, n_heads=12, n_kv_heads=2, head_dim=128,
+def run_case(name, B, new_lens, prefix_lens, n_heads=12, n_kv_heads=2, head_dim=128,
               num_gpu_blocks=200, MAX_BLOCKS_PER_SEQ=32, atol=1e-2, rtol=1e-2):
     """
     通用测试：构造 B 个 batch，每个有自己的 prefix_len 和 new_len，
@@ -184,55 +184,55 @@ def test_case(name, B, new_lens, prefix_lens, n_heads=12, n_kv_heads=2, head_dim
 
 def test_1_no_prefix_single_batch():
     """完整 prefill，无 prefix，B=1，等价于传统 prefill"""
-    return test_case("1. 无 prefix，B=1，new_len=32",
+    assert run_case("1. 无 prefix，B=1，new_len=32",
                      B=1, new_lens=[32], prefix_lens=[0])
 
 
 def test_2_no_prefix_aligned():
     """无 prefix，new_len 对齐 block_size"""
-    return test_case("2. 无 prefix，new_len=64 (对齐)",
+    assert run_case("2. 无 prefix，new_len=64 (对齐)",
                      B=1, new_lens=[64], prefix_lens=[0])
 
 
 def test_3_no_prefix_unaligned():
     """无 prefix，new_len 不对齐 block_size"""
-    return test_case("3. 无 prefix，new_len=37 (不对齐)",
+    assert run_case("3. 无 prefix，new_len=37 (不对齐)",
                      B=1, new_lens=[37], prefix_lens=[0])
 
 
 def test_4_with_prefix_aligned():
     """有 prefix，都对齐"""
-    return test_case("4. prefix_len=32, new_len=16 (都对齐)",
+    assert run_case("4. prefix_len=32, new_len=16 (都对齐)",
                      B=1, new_lens=[16], prefix_lens=[32])
 
 
 def test_5_with_prefix_unaligned_prefix():
     """prefix_len 不对齐"""
-    return test_case("5. prefix_len=20, new_len=16 (prefix 不对齐)",
+    assert run_case("5. prefix_len=20, new_len=16 (prefix 不对齐)",
                      B=1, new_lens=[16], prefix_lens=[20])
 
 
 def test_6_with_prefix_unaligned_both():
     """两个都不对齐"""
-    return test_case("6. prefix_len=20, new_len=15 (都不对齐)",
+    assert run_case("6. prefix_len=20, new_len=15 (都不对齐)",
                      B=1, new_lens=[15], prefix_lens=[20])
 
 
 def test_7_long_prefix():
     """长 prefix"""
-    return test_case("7. prefix_len=200, new_len=20",
+    assert run_case("7. prefix_len=200, new_len=20",
                      B=1, new_lens=[20], prefix_lens=[200])
 
 
 def test_8_single_new_token():
     """new_len=1，退化为 decode 的语义（但用 prefill kernel）"""
-    return test_case("8. prefix_len=32, new_len=1",
+    assert run_case("8. prefix_len=32, new_len=1",
                      B=1, new_lens=[1], prefix_lens=[32])
 
 
 def test_9_batch_mixed():
     """多 batch 混合：不同 prefix_len 和 new_len"""
-    return test_case("9. B=3, 混合长度",
+    assert run_case("9. B=3, 混合长度",
                      B=3,
                      new_lens=[16, 32, 8],
                      prefix_lens=[0, 48, 20])
@@ -240,7 +240,7 @@ def test_9_batch_mixed():
 
 def test_10_batch_all_no_prefix():
     """多 batch 全部无 prefix（等价于普通 batch prefill）"""
-    return test_case("10. B=4, 全无 prefix",
+    assert run_case("10. B=4, 全无 prefix",
                      B=4,
                      new_lens=[16, 24, 32, 8],
                      prefix_lens=[0, 0, 0, 0])
@@ -248,7 +248,7 @@ def test_10_batch_all_no_prefix():
 
 def test_11_batch_all_with_prefix():
     """多 batch 全部有 prefix"""
-    return test_case("11. B=4, 全部有 prefix",
+    assert run_case("11. B=4, 全部有 prefix",
                      B=4,
                      new_lens=[8, 16, 4, 12],
                      prefix_lens=[32, 48, 16, 64])
@@ -256,7 +256,7 @@ def test_11_batch_all_with_prefix():
 
 def test_12_large_scale():
     """大规模：长序列 + 大 batch"""
-    return test_case("12. 大规模 B=4",
+    assert run_case("12. 大规模 B=4",
                      B=4,
                      new_lens=[64, 128, 48, 96],
                      prefix_lens=[100, 50, 200, 30])

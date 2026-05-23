@@ -125,10 +125,10 @@ python benchmarks/benchmark_prefix_cache_long.py
 | 00_env | 语法编译、依赖和项目导入检测 | CPU |
 | 01_ops | CPU Torch 算子；有 CUDA 时追加 Triton 算子正确性 | CPU / CUDA |
 | 02_single_card | 单设备模型推理 smoke：CPU tiny、CUDA tiny、可选 CPU 真实 Qwen 权重推理 | CPU / 1 张 CUDA 卡 / 本地权重 |
-| 03_single_node_multi_card | 单机多卡 NCCL all-reduce smoke | 至少 2 张 CUDA 卡 |
-| 04_multi_card | tiny tensor-parallel model smoke | 至少 2 张 CUDA 卡 |
+| 03_single_node_multi_card | 暂空，待补单机多卡测试设计 | 暂无 |
+| 04_multi_card | 暂空，待补多机多卡测试设计 | 暂无 |
 
-测试目录按层级组织在 `pico_vllm/tests/` 下，尚未迁移到分层 CI 的历史脚本放在 `pico_vllm/tests/legacy/`。每次运行会在 `logs/local_ci/<timestamp>/` 下生成 `summary.log` 和逐 case 日志，包含 stdout/stderr、pytest 输出、推理 token、耗时、吞吐和失败上下文。
+测试目录分成两条线：`pico_vllm/tests/ci/` 是功能交付测试，服务于分层 CI；`pico_vllm/tests/benchmark/` 是端到端性能测试，服务于 Pico-vLLM / vLLM / SGLang 的同 workload 对比。尚未迁移到分层 CI 的历史脚本放在 `pico_vllm/tests/legacy/`。每次运行 CI 会在 `logs/local_ci/<timestamp>/` 下生成 `summary.log` 和逐 case 日志，包含 stdout/stderr、pytest 输出、推理 token、耗时、吞吐和失败上下文。
 
 只跑指定层级：
 
@@ -151,6 +151,26 @@ PICO_VLLM_CPU_REAL_MAX_NEW_TOKENS=32 \
 ```bash
 .venv/bin/python scripts/local_ci.py --list
 ```
+
+### 运行标准 Benchmark
+
+Benchmark 与 CI 分开：CI 只检查功能是否通，Benchmark 检查端到端性能是否够好。标准 benchmark 位于 `pico_vllm/tests/benchmark/`，使用同一组输入 token 长度、输出 token 数、并发数和 greedy decoding，对 Pico-vLLM、vLLM、SGLang 输出同一 schema 的 JSONL/CSV/Markdown/PNG。
+
+Pico-vLLM 本地 engine：
+
+```bash
+.venv/bin/python pico_vllm/tests/benchmark/standard_benchmark.py \
+  --backend pico \
+  --engine pico \
+  --weights ./weights \
+  --model ./weights \
+  --input-lens 128,512,2048 \
+  --output-lens 32 \
+  --concurrency 1,4,8 \
+  --output logs/benchmarks/standard/qwen15b_compare.jsonl
+```
+
+vLLM / SGLang 使用各自 OpenAI-compatible server，benchmark 通过 `--backend openai --engine vllm|sglang --api-base ...` 打到同一套 streaming API。把三次运行追加到同一个 `--output` 文件即可生成统一对比表和图。
 
 尚未迁移到分层 CI 的历史脚本默认不参与 `pytest pico_vllm/tests` 收集；如需临时收集旧脚本，可显式设置：
 

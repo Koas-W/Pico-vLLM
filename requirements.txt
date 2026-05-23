@@ -1,7 +1,9 @@
 # Core runtime requirements from README.md.
-# Install a CUDA-enabled PyTorch build appropriate for your driver/CUDA stack.
-torch>=2.1
-triton>=2.1
+# This H200 environment has a CUDA 12.8 driver. Pin PyTorch to the matching
+# CUDA 12.8 wheel; the default PyPI torch wheel may require a newer driver.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+triton==3.6.0
 transformers>=4.0
 safetensors>=0.4
 
