@@ -170,7 +170,21 @@ Pico-vLLM 本地 engine：
   --output logs/benchmarks/standard/qwen15b_compare.jsonl
 ```
 
-vLLM / SGLang 使用各自 OpenAI-compatible server，benchmark 通过 `--backend openai --engine vllm|sglang --api-base ...` 打到同一套 streaming API。把三次运行追加到同一个 `--output` 文件即可生成统一对比表和图。
+一键对比入口会顺序运行选中的 engine，并把结果写入同一个 JSONL，最后生成统一 CSV/Markdown/PNG。默认 `--server-mode docker` 会自动启动 vLLM 和 SGLang 容器；也可以用 `--server-mode external` 连接已经启动的 OpenAI-compatible server。
+
+```bash
+.venv/bin/python scripts/run_standard_benchmark.py \
+  --engines pico,vllm,sglang \
+  --server-mode docker \
+  --weights ./weights \
+  --model ./weights \
+  --input-lens 128,512,2048 \
+  --output-lens 32 \
+  --concurrency 1,4,8 \
+  --output logs/benchmarks/standard/qwen15b_compare.jsonl
+```
+
+vLLM / SGLang 仍可手动启动后通过 `standard_benchmark.py --backend openai --engine vllm|sglang --api-base ...` 单独测试。
 
 尚未迁移到分层 CI 的历史脚本默认不参与 `pytest pico_vllm/tests` 收集；如需临时收集旧脚本，可显式设置：
 

@@ -362,11 +362,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-prefix-cache", action="store_true")
     parser.add_argument("--output", default="")
     parser.add_argument("--no-report", action="store_true")
+    parser.add_argument("--report-only", action="store_true", help="Regenerate CSV/Markdown/PNG reports from --output JSONL.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.report_only:
+        if not args.output:
+            raise ValueError("--report-only requires --output")
+        output = Path(args.output)
+        write_csv(output, output.with_suffix(".csv"))
+        write_markdown(output, output.with_suffix(".md"))
+        write_plot(output, output.with_suffix(".png"))
+        return 0
+
     input_lens = parse_csv_ints(args.input_lens)
     output_lens = parse_csv_ints(args.output_lens)
     concurrencies = parse_csv_ints(args.concurrency)
