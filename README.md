@@ -12,7 +12,7 @@
 
 **分布式推理**：实现了 Tensor Parallelism + PD 分离（NCCL后端，支持同步/异步模式）。支持异构并行度组合（P(TP=2)+D(TP=1) ，或者反过来），解决跨并行度的 KV head 重映射。通过 PD 分离，实现 ITL 提升 5.2x，tail latency 从 ~50ms 降低到 ~2ms。
 
-**性能分析**：完整的 nsys profiling 和跨硬件对比（5090 PCIe vs B200 NVLink）（详情参考[Fain的blog](https://koas-w.github.io/)）。在 Qwen2.5-1.5B 模型的 ~2000 token 请求长度下， CPU overhead 仅占总执行时间 6%。
+**性能分析**：完整的 nsys profiling 和跨硬件对比（5070 PCIe vs B200 NVLink）（详情参考[Fain的blog](https://koas-w.github.io/)）。在 Qwen2.5-1.5B 模型的 ~2000 token 请求长度下， CPU overhead 仅占总执行时间 6%。
 
 ## 特性清单
 
@@ -38,7 +38,7 @@
 
 ## 性能数据
 
-### 消费级单卡推理（5090 PCIe, bfloat16）
+### 消费级单卡推理（5070 PCIe, bfloat16）
 
 | 指标 | Pico-vLLM | vLLM (同硬件) |
 |:---|:---:|:---:|
