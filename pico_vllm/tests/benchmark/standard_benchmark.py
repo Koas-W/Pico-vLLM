@@ -154,15 +154,25 @@ def collect_pico_requests(engine) -> dict[int, Any]:
     requests.extend(engine.scheduler.decoding)
     requests.extend(engine.scheduler.finished)
     return {request.request_id: request for request in requests}
+def _make_warmup_token_ids(case: WorkloadCase) -> list[list[int]]:
+    """Distinct token ids so warmup never primes the prefix cache for the real run."""
+    base = list(range(100, 100 + case.input_tokens))
+    return [list(base) for _ in range(case.concurrency)]
 
-def run_pico_engine_workload(args, case: WorkloadCase, trace: RequestTrace, rank: int, world_size: int, local_rank: int) -> dict[str, Any] | None:
+
+def _warmup_output_tokens(case: WorkloadCase) -> int:
+    return max(4, min(case.output_tokens, 8))
+
+
+def run_pico_engine_workload(
+    args, case: WorkloadCase, trace: RequestTrace, rank: int, world_size: int, local_rank: int
+) -> dict[str, Any] | None:
     import benchmark_h200_baseline as pico_baseline
 
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.set_device(device)
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device)
 
     pico_args = argparse.Namespace(
         weights=args.weights,
@@ -187,41 +197,40 @@ def run_pico_engine_workload(args, case: WorkloadCase, trace: RequestTrace, rank
         max_concurrency=case.concurrency,
     )
 
+    # ---- Real run -----------------------------------------------------------
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
     request_ids = [
-        engine.submit_token_ids(prompt_ids, max_new_tokens=case.output_tokens, temperature=0.0, top_p=1.0)
+        engine.submit_token_ids(
+            prompt_ids, max_new_tokens=case.output_tokens, temperature=0.0, top_p=1.0
+        )
         for prompt_ids in trace.prompt_token_ids
     ]
     engine.mark_finished()
 
-    def current_output_lens() -> list[int]:
-        requests = collect_pico_requests(engine)
-        return [len(requests[request_id].generated_ids) for request_id in request_ids if request_id in requests]
+    # Cheap state queries only inside the timed loop.
+    scheduler = engine.scheduler
 
-    def unfinished_request_count() -> int:
-        return sum(length < case.output_tokens for length in current_output_lens())
+    def active_count() -> int:
+        return len(scheduler.waiting) + len(scheduler.prefilling) + len(scheduler.decoding)
 
     cuda_sync(device)
     start = time.perf_counter()
     steps = 0
-    active_counts: list[int] = []
-    while True:
-        active_counts.append(unfinished_request_count())
+    max_active = 0
+    while not engine.is_done():
+        max_active = max(max_active, active_count())
         engine.step()
         steps += 1
-        output_lens = current_output_lens()
-        if len(output_lens) == len(request_ids) and all(length >= case.output_tokens for length in output_lens):
-            break
-        if engine.is_done():
-            break
     cuda_sync(device)
     total_ms = (time.perf_counter() - start) * 1000.0
 
-    # Keep request cleanup out of the measured generation window.
-    while not engine.is_done():
-        engine.step()
-
+    # ---- Post-timing introspection -----------------------------------------
     requests = collect_pico_requests(engine)
-    output_lens = [len(requests[request_id].generated_ids) for request_id in request_ids if request_id in requests]
+    output_lens = [
+        len(requests[rid].generated_ids) for rid in request_ids if rid in requests
+    ]
     raw_output_tokens = sum(output_lens)
     completed = sum(length >= case.output_tokens for length in output_lens)
 
@@ -231,7 +240,7 @@ def run_pico_engine_workload(args, case: WorkloadCase, trace: RequestTrace, rank
         "total_output_tokens_observed": raw_output_tokens,
         "engine_total_ms": total_ms,
         "engine_steps": steps,
-        "max_active_requests": max(active_counts) if active_counts else 0,
+        "max_active_requests": max_active,
         "per_request_output_tokens": output_lens,
         "gpu_blocks_total": block_manager.num_physical_gpu_blocks,
         "gpu_blocks_free": len(block_manager.gpu_free_blocks),
@@ -248,7 +257,15 @@ def run_pico_engine_workload(args, case: WorkloadCase, trace: RequestTrace, rank
         return None
     return normalize_result(args, case, trace, result)
 
+
 def run_vllm_engine_workload(args, case: WorkloadCase, trace: RequestTrace) -> dict[str, Any]:
+    # vLLM V1 runs the engine in a separate EngineCore process by default, so a
+    # client-side torch.cuda.synchronize() does NOT wait for the engine's GPU
+    # work -> the step-loop wall clock is meaningless for short workloads.
+    # Force the engine in-process so the existing timing is valid. Must be set
+    # before importing vllm.
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
     from vllm import LLM, SamplingParams, TokensPrompt
     from vllm.sampling_params import RequestOutputKind
 
@@ -263,48 +280,61 @@ def run_vllm_engine_workload(args, case: WorkloadCase, trace: RequestTrace) -> d
         "enable_prefix_caching": args.enable_prefix_cache,
         "enforce_eager": args.disable_cuda_graph,
         "disable_log_stats": True,
+        # Async scheduling overlaps CPU scheduling with GPU work, which makes the
+        # step-loop wall-clock timing unreliable (e.g. spurious sub-ms totals on
+        # short workloads). Disable it for deterministic, comparable measurement.
+        "async_scheduling": getattr(args, "vllm_async_scheduling", False),
     }
     llm = LLM(**llm_kwargs)
-    # echo: sampling params will effect inference speed, need a solid config
-    def make_sampling_params() -> SamplingParams:
+
+    def make_sampling_params(max_tokens: int) -> SamplingParams:
         return SamplingParams(
             n=1,
             temperature=0.0,
             top_p=1.0,
             ignore_eos=True,
-            max_tokens=case.output_tokens,
+            max_tokens=max_tokens,
             detokenize=False,
             output_kind=RequestOutputKind.FINAL_ONLY,
         )
+
+    # ---- Real run -----------------------------------------------------------
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
     for index, prompt_ids in enumerate(trace.prompt_token_ids):
         llm.llm_engine.add_request(
             str(index),
             TokensPrompt(prompt_token_ids=list(prompt_ids)),
-            make_sampling_params(),
+            make_sampling_params(case.output_tokens),
         )
 
+    final_outputs: list[Any] = []
     cuda_sync()
     start = time.perf_counter()
     steps = 0
     max_active = 0
-    completed = 0
-    output_lens: dict[str, int] = {}
     while llm.llm_engine.has_unfinished_requests():
         if hasattr(llm.llm_engine, "get_num_unfinished_requests"):
             max_active = max(max_active, int(llm.llm_engine.get_num_unfinished_requests()))
         step_outputs = llm.llm_engine.step()
         steps += 1
+        # Cheap inside the loop: just keep references. Decode them after timing.
         for output in step_outputs:
-            if not getattr(output, "finished", False):
-                continue
-            completed += 1
-            output_lens[output.request_id] = sum(len(completion.token_ids) for completion in output.outputs)
+            if getattr(output, "finished", False):
+                final_outputs.append(output)
     cuda_sync()
     total_ms = (time.perf_counter() - start) * 1000.0
 
-    per_request_output_tokens = [output_lens.get(str(index), 0) for index in range(case.concurrency)]
+    # ---- Post-timing introspection -----------------------------------------
+    output_lens: dict[str, int] = {
+        output.request_id: sum(len(c.token_ids) for c in output.outputs)
+        for output in final_outputs
+    }
+    per_request_output_tokens = [output_lens.get(str(i), 0) for i in range(case.concurrency)]
     raw_output_tokens = sum(per_request_output_tokens)
+    completed = len(output_lens)
+
     result: dict[str, Any] = {
         "completed": completed,
         "raw_completed": completed,
@@ -322,7 +352,6 @@ def run_vllm_engine_workload(args, case: WorkloadCase, trace: RequestTrace) -> d
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return normalize_result(args, case, trace, result)
-
 
 def normalize_result(args, case: WorkloadCase, trace: RequestTrace, result: dict[str, Any]) -> dict[str, Any]:
     expected_tokens = case.concurrency * case.output_tokens
@@ -455,6 +484,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vllm-dtype", default="bfloat16")
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--vllm-max-model-len", type=int, default=0)
+    parser.add_argument("--vllm-async-scheduling", action="store_true", help="Enable vLLM async scheduling (off by default for reliable timing).")
     parser.add_argument("--output", default="")
     parser.add_argument("--no-report", action="store_true")
     parser.add_argument("--report-only", action="store_true", help="Regenerate CSV/Markdown/PNG reports from --output JSONL.")

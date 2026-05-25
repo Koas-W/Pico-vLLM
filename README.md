@@ -38,12 +38,41 @@
 
 ## 性能数据
 
-### 单卡推理（5090 PCIe, bfloat16）
+### 消费级单卡推理（5090 PCIe, bfloat16）
 
 | 指标 | Pico-vLLM | vLLM (同硬件) |
 |:---|:---:|:---:|
 | Decode Throughput | 97 tok/s | 95 tok/s |
 | 带宽利用率 | 78% | 77% |
+
+### Flash Decode + Prefill 对比矩阵（H200, bfloat16, concurrency=1, best-of-3）
+
+GQA 分组 split-KV flash decode + GQA 分组 causal flash prefill（默认启用，`PICO_ATTN=legacy` 可回退到原始 kernel）。vLLM 开启其默认性能优化（CUDA Graph + async scheduling）。两个推理框架均关闭 prefix cache，采用同样的greedy decoding采样策略以确保比较的公平。
+
+**Decode 吞吐 tok/s（output / 总时间），Pico-vLLM / vLLM：**
+
+| input ＼ output | 16 | 128 | 1024 |
+|:---|:---:|:---:|:---:|
+| 64   | 402 / 405 | 520 / 472 | 534 / 479 |
+| 512  | 379 / 399 | 506 / 470 | 523 / 479 |
+| 2048 | 326 / 364 | 470 / 459 | 495 / 474 |
+| 8192 | 131 / 200 | 330 / 399 | 404 / 451 |
+
+**Prefill 延迟 TTFT ms，Pico-vLLM / vLLM：**
+
+| input | 64 | 512 | 2048 | 8192 |
+|:---|:---:|:---:|:---:|:---:|
+| Pico-vLLM | 12.1 | 13.7 | 19.2 | 86.2 |
+| vLLM | 8.1 | 8.1 | 11.7 | 44.6 |
+
+复现（执行程序 `pico_vllm/tests/benchmark/accept_benchmark.py`）：
+
+```bash
+PYTHONPATH=pico_vllm:pico_vllm/benchmarks python pico_vllm/tests/benchmark/accept_benchmark.py \
+    --engine pico --reps 3 --out logs/benchmarks/accept.jsonl
+PYTHONPATH=pico_vllm:pico_vllm/benchmarks python pico_vllm/tests/benchmark/accept_benchmark.py \
+    --engine vllm --reps 3 --out logs/benchmarks/accept.jsonl
+```
 
 ### Prefix Cache（2083-token 共享前缀）
 

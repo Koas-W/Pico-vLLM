@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 
@@ -10,6 +12,12 @@ class TritonOps(OpsBackend):
     name = "triton"
     device_type = "cuda"
     supports_cuda_graph = True
+
+    # Attention kernel selection (read once; constant for the run, so the choice
+    # is baked into the CUDA graph at capture time). Controls BOTH decode and
+    # prefill. Default "flash": GQA-grouped split-KV decode + GQA-grouped causal
+    # prefill. Set env PICO_ATTN=legacy to fall back to the original kernels.
+    _attn = os.environ.get("PICO_ATTN", "flash").lower()
 
     def create_rms_norm(self, hidden_size: int, eps: float = 1e-6) -> nn.Module:
         from .rms_norm import FastRMSNorm
@@ -65,9 +73,22 @@ class TritonOps(OpsBackend):
         MAX_BLOCKS_PER_SEQ: int,
         BLOCK_SIZE: int = 16,
     ) -> torch.Tensor:
-        from .attention import paged_decode_attention
+        if self._attn == "legacy":
+            from .attention import paged_decode_attention
 
-        return paged_decode_attention(
+            return paged_decode_attention(
+                q,
+                k_cache,
+                v_cache,
+                block_table,
+                context_lens,
+                MAX_BLOCKS_PER_SEQ=MAX_BLOCKS_PER_SEQ,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+
+        from .flash_decode import paged_decode_attention_flash
+
+        return paged_decode_attention_flash(
             q,
             k_cache,
             v_cache,
@@ -90,6 +111,22 @@ class TritonOps(OpsBackend):
         BLOCK_SIZE: int = 16,
         BLOCK_M: int = 16,
     ) -> torch.Tensor:
+        if self._attn != "legacy":
+            from .flash_prefill import paged_prefill_attention_flash
+
+            return paged_prefill_attention_flash(
+                q,
+                k_cache,
+                v_cache,
+                block_table,
+                context_lens,
+                new_token_lens,
+                q_start_loc,
+                MAX_BLOCKS_PER_SEQ=MAX_BLOCKS_PER_SEQ,
+                BLOCK_SIZE=BLOCK_SIZE,
+                BLOCK_M=BLOCK_M,
+            )
+
         from .attention import paged_prefill_attention
 
         return paged_prefill_attention(

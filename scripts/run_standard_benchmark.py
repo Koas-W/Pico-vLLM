@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="logs/benchmarks/standard/engine_compare.jsonl")
     parser.add_argument("--pico-python", default=sys.executable, help="Python executable used for Pico engine benchmark.")
     parser.add_argument("--vllm-python", default=default_vllm_python(), help="Python executable used for vLLM engine benchmark.")
-    parser.add_argument("--num-gpu-blocks", type=int, default=0)
+    parser.add_argument("--num-gpu-blocks", type=int, default=4096)
     parser.add_argument("--block-slack", type=int, default=256)
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--max-num-seqs", type=int, default=8)
