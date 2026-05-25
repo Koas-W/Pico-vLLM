@@ -163,10 +163,15 @@ class Scheduler:
                 still_decoding.append(request)
         self.decoding = still_decoding
 
-        # 2. prefilling 整批搬到 decoding —— 一次 extend + clear 比逐个 remove 高效
+        # 2. prefilling 整批搬到 decoding。prefill 阶段已经可能生成首 token；
+        # max_new_tokens=1 时请求应直接完成，不能再进入下一轮 decode。
         for request in self.prefilling:
-            request.request_status = RequestStatus.DECODING
-        self.decoding.extend(self.prefilling)
+            if request.has_finished_notification:
+                request.request_status = RequestStatus.FINISHED
+                self.finished.append(request)
+            else:
+                request.request_status = RequestStatus.DECODING
+                self.decoding.append(request)
         self.prefilling.clear()
 
         # 3. 从 waiting 队列中取出请求，放入 prefilling 队列，直到达到 max_batch_size

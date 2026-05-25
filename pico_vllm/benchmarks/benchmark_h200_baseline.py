@@ -154,13 +154,28 @@ def create_engine(args, device: torch.device, rank: int, world_size: int, max_pr
         local_tp_size=world_size,
         role="pd",
         enable_prefix_cache=not args.disable_prefix_cache,
+        detokenize_outputs=getattr(args, "detokenize_outputs", True),
+        ignore_eos=getattr(args, "ignore_eos", False),
     )
     engine.scheduler.max_num_seqs = max(args.max_num_seqs, max_concurrency)
     return engine, tokenizer, block_manager
 
 
-def run_workload(args, engine: Engine, tokenizer, block_manager: BlockManager, prompt_len: int, concurrency: int, device: torch.device):
-    prompts = [make_prompt(tokenizer, prompt_len) for _ in range(concurrency)]
+def run_workload(
+    args,
+    engine: Engine,
+    tokenizer,
+    block_manager: BlockManager,
+    prompt_len: int,
+    concurrency: int,
+    device: torch.device,
+    prompts: list[str] | None = None,
+):
+    if prompts is None:
+        prompts = [make_prompt(tokenizer, prompt_len) for _ in range(concurrency)]
+    if len(prompts) != concurrency:
+        raise ValueError(f"Expected {concurrency} prompts, got {len(prompts)}")
+    prompt_token_counts = [len(tokenizer.encode(prompt)) for prompt in prompts]
     request_ids = [
         engine.submit(prompt, max_new_tokens=args.max_new_tokens, temperature=0.0, top_p=1.0)
         for prompt in prompts
@@ -219,6 +234,8 @@ def run_workload(args, engine: Engine, tokenizer, block_manager: BlockManager, p
         "prompt_len": prompt_len,
         "concurrency": concurrency,
         "max_new_tokens": args.max_new_tokens,
+        "prompt_token_counts": prompt_token_counts,
+        "prompt_token_count": prompt_token_counts[0] if len(set(prompt_token_counts)) == 1 else 0,
         "completed": completed,
         "total_output_tokens_observed": total_output_tokens,
         "total_ms": total_ms,
