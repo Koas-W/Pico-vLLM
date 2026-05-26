@@ -12,7 +12,7 @@
 
 **分布式推理**：实现了 Tensor Parallelism + PD 分离（NCCL后端，支持同步/异步模式）。支持异构并行度组合（P(TP=2)+D(TP=1) ，或者反过来），解决跨并行度的 KV head 重映射。通过 PD 分离，实现 ITL 提升 5.2x，tail latency 从 ~50ms 降低到 ~2ms。
 
-**性能分析**：完整的 nsys profiling 和跨硬件对比（5090 PCIe vs B200 NVLink）（详情参考[Fain的blog](https://koas-w.github.io/)）。在 Qwen2.5-1.5B 模型的 ~2000 token 请求长度下， CPU overhead 仅占总执行时间 6%。
+**性能分析**：完整的 nsys profiling 和跨硬件对比（5070 PCIe vs B200 NVLink）（详情参考[Fain的blog](https://koas-w.github.io/)）。在 Qwen2.5-1.5B 模型的 ~2000 token 请求长度下， CPU overhead 仅占总执行时间 6%。
 
 ## 特性清单
 
@@ -38,12 +38,41 @@
 
 ## 性能数据
 
-### 单卡推理（5090 PCIe, bfloat16）
+### 消费级单卡推理（5070 PCIe, bfloat16）
 
 | 指标 | Pico-vLLM | vLLM (同硬件) |
 |:---|:---:|:---:|
 | Decode Throughput | 97 tok/s | 95 tok/s |
 | 带宽利用率 | 78% | 77% |
+
+### Flash Decode + Prefill 对比矩阵（H200, bfloat16, concurrency=1, best-of-3）
+
+GQA 分组 split-KV flash decode + GQA 分组 causal flash prefill（默认启用，`PICO_ATTN=legacy` 可回退到原始 kernel）。vLLM 开启其默认性能优化（CUDA Graph + async scheduling）。两个推理框架均关闭 prefix cache，采用同样的greedy decoding采样策略以确保比较的公平。
+
+**Decode 吞吐 tok/s（output / 总时间），Pico-vLLM / vLLM：**
+
+| input ＼ output | 16 | 128 | 1024 |
+|:---|:---:|:---:|:---:|
+| 64   | 402 / 405 | 520 / 472 | 534 / 479 |
+| 512  | 379 / 399 | 506 / 470 | 523 / 479 |
+| 2048 | 326 / 364 | 470 / 459 | 495 / 474 |
+| 8192 | 131 / 200 | 330 / 399 | 404 / 451 |
+
+**Prefill 延迟 TTFT ms，Pico-vLLM / vLLM：**
+
+| input | 64 | 512 | 2048 | 8192 |
+|:---|:---:|:---:|:---:|:---:|
+| Pico-vLLM | 12.1 | 13.7 | 19.2 | 86.2 |
+| vLLM | 8.1 | 8.1 | 11.7 | 44.6 |
+
+复现（执行程序 `pico_vllm/tests/benchmark/accept_benchmark.py`）：
+
+```bash
+PYTHONPATH=pico_vllm:pico_vllm/benchmarks python pico_vllm/tests/benchmark/accept_benchmark.py \
+    --engine pico --reps 3 --out logs/benchmarks/accept.jsonl
+PYTHONPATH=pico_vllm:pico_vllm/benchmarks python pico_vllm/tests/benchmark/accept_benchmark.py \
+    --engine vllm --reps 3 --out logs/benchmarks/accept.jsonl
+```
 
 ### Prefix Cache（2083-token 共享前缀）
 
@@ -125,10 +154,10 @@ python benchmarks/benchmark_prefix_cache_long.py
 | 00_env | 语法编译、依赖和项目导入检测 | CPU |
 | 01_ops | CPU Torch 算子；有 CUDA 时追加 Triton 算子正确性 | CPU / CUDA |
 | 02_single_card | 单设备模型推理 smoke：CPU tiny、CUDA tiny、可选 CPU 真实 Qwen 权重推理 | CPU / 1 张 CUDA 卡 / 本地权重 |
-| 03_single_node_multi_card | 单机多卡 NCCL all-reduce smoke | 至少 2 张 CUDA 卡 |
-| 04_multi_card | tiny tensor-parallel model smoke | 至少 2 张 CUDA 卡 |
+| 03_single_node_multi_card | 暂空，待补单机多卡测试设计 | 暂无 |
+| 04_multi_card | 暂空，待补多机多卡测试设计 | 暂无 |
 
-测试目录按层级组织在 `pico_vllm/tests/` 下，尚未迁移到分层 CI 的历史脚本放在 `pico_vllm/tests/legacy/`。每次运行会在 `logs/local_ci/<timestamp>/` 下生成 `summary.log` 和逐 case 日志，包含 stdout/stderr、pytest 输出、推理 token、耗时、吞吐和失败上下文。
+测试目录分成两条线：`pico_vllm/tests/ci/` 是功能交付测试，服务于分层 CI；`pico_vllm/tests/benchmark/` 是端到端性能测试，服务于 Pico-vLLM / vLLM / SGLang 的同 workload 对比。尚未迁移到分层 CI 的历史脚本放在 `pico_vllm/tests/legacy/`。每次运行 CI 会在 `logs/local_ci/<timestamp>/` 下生成 `summary.log` 和逐 case 日志，包含 stdout/stderr、pytest 输出、推理 token、耗时、吞吐和失败上下文。
 
 只跑指定层级：
 
@@ -151,6 +180,40 @@ PICO_VLLM_CPU_REAL_MAX_NEW_TOKENS=32 \
 ```bash
 .venv/bin/python scripts/local_ci.py --list
 ```
+
+### 运行标准 Benchmark
+
+Benchmark 与 CI 分开：CI 只检查功能是否通，Benchmark 检查端到端性能是否够好。标准 benchmark 位于 `pico_vllm/tests/benchmark/`，使用同一组输入 token 长度、输出 token 数、并发数和 greedy decoding，对 Pico-vLLM、vLLM、SGLang 输出同一 schema 的 JSONL/CSV/Markdown/PNG。
+
+Pico-vLLM 本地 engine：
+
+```bash
+.venv/bin/python pico_vllm/tests/benchmark/standard_benchmark.py \
+  --backend pico \
+  --engine pico \
+  --weights ./weights \
+  --model ./weights \
+  --input-lens 128,512,2048 \
+  --output-lens 32 \
+  --concurrency 1,4,8 \
+  --output logs/benchmarks/standard/qwen15b_compare.jsonl
+```
+
+一键对比入口会顺序运行选中的 engine，并把结果写入同一个 JSONL，最后生成统一 CSV/Markdown/PNG。默认 `--server-mode docker` 会自动启动 vLLM 和 SGLang 容器；也可以用 `--server-mode external` 连接已经启动的 OpenAI-compatible server。
+
+```bash
+.venv/bin/python scripts/run_standard_benchmark.py \
+  --engines pico,vllm,sglang \
+  --server-mode docker \
+  --weights ./weights \
+  --model ./weights \
+  --input-lens 128,512,2048 \
+  --output-lens 32 \
+  --concurrency 1,4,8 \
+  --output logs/benchmarks/standard/qwen15b_compare.jsonl
+```
+
+vLLM / SGLang 仍可手动启动后通过 `standard_benchmark.py --backend openai --engine vllm|sglang --api-base ...` 单独测试。
 
 尚未迁移到分层 CI 的历史脚本默认不参与 `pytest pico_vllm/tests` 收集；如需临时收集旧脚本，可显式设置：
 

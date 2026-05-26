@@ -28,6 +28,8 @@ class Engine:
                  role:str="pd",
                  enable_prefix_cache=True,
                  manual_seed=42,
+                 detokenize_outputs: bool = True,
+                 ignore_eos: bool = False,
                  ):
         device = torch.device(device)
         if device.type != "cuda":
@@ -61,6 +63,8 @@ class Engine:
         )
         self.block_manager = block_manager
         self.eos_token_id = tokenizer.eos_token_id
+        self.detokenize_outputs = detokenize_outputs
+        self.ignore_eos = ignore_eos
 
         ### tp 并行相关设置 ###
         self.local_tp_size = local_tp_size
@@ -265,16 +269,22 @@ class Engine:
             temperature: float, 
             top_p: float) -> int:
             """提交生成请求，返回 request_id"""
+            input_ids = self.tokenizer.encode(prompt)
+            return self.submit_token_ids(input_ids, max_new_tokens, temperature, top_p)
+
+    def submit_token_ids(
+            self,
+            input_ids: list[int],
+            max_new_tokens: int,
+            temperature: float,
+            top_p: float) -> int:
+            """提交已经 tokenized 的生成请求，避免 engine benchmark 计入 tokenizer。"""
             # 如果已经完成，返回-1
             if self.no_more_requests:
                 return -1
-            
-            # tokenizer 默认已经返回 List[int]，避免多一次 CPU→GPU→CPU 的绕路
-            input_ids = self.tokenizer.encode(prompt)
 
-            request = self.scheduler.create_request(input_ids, max_new_tokens, temperature, top_p,
+            request = self.scheduler.create_request(list(input_ids), max_new_tokens, temperature, top_p,
                                                      self.kv_cache_cls, self.kv_cache_kwargs)
-            
 
             # 在submit的时候，进行一次 prefix match 过程，insert 操作则在 Prefill 结束之后对整个 Prefill 输入序列进行
             if self.prefix_cache is not None:
@@ -293,6 +303,11 @@ class Engine:
             
             self.scheduler.add_request(request)
             return request.request_id
+
+    def _completed_text(self, request: Request) -> str:
+        if not self.detokenize_outputs:
+            return ""
+        return self.tokenizer.decode(request.input_ids + request.generated_ids)
     
     def mark_finished(self):
         """通知 Engine 不会再有新请求提交"""
@@ -396,11 +411,12 @@ class Engine:
             if self.role == "p":
                 self.transfer.send_request(request)
                 request.has_finished_notification = True
-            elif next_token_id.item() == self.eos_token_id or request.is_max_len_finished():
+            elif ((not self.ignore_eos and next_token_id.item() == self.eos_token_id)
+                  or request.is_max_len_finished()):
                 request.has_finished_notification = True
                 completed_requests.append((
                     request.request_id,
-                    self.tokenizer.decode(request.input_ids + request.generated_ids)
+                    self._completed_text(request)
                 ))
             # t_done = time.perf_counter()
             # print(f"[prefill] schedule={t1-t0:.5f} "
@@ -433,11 +449,12 @@ class Engine:
             token_ids = sampler.sample_batch(logits_batch, temps, top_ps)
             for i, request in enumerate(decoding):
                 request.generated_ids.append(token_ids[i])
-                if token_ids[i] == self.eos_token_id or request.is_max_len_finished():
+                if ((not self.ignore_eos and token_ids[i] == self.eos_token_id)
+                    or request.is_max_len_finished()):
                     request.has_finished_notification = True
                     completed_requests.append((
                         request.request_id,
-                        self.tokenizer.decode(request.input_ids + request.generated_ids)
+                        self._completed_text(request)
                     ))
 
         # === 统一释放 FINISHED 请求的资源 ===

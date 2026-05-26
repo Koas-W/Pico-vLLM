@@ -7,6 +7,8 @@ weights/
 logs/
 venv/
 .venv/
+.venv-vllm/
+.venv-vllm019/
 .codex
 **/.codex
 .vscode/

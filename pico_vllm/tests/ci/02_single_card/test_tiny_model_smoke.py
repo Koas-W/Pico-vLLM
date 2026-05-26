@@ -15,11 +15,11 @@ def test_tiny_model_prefill_and_decode_on_single_cuda_card():
 
     cfg = ModelConfig(
         vocab_size=64,
-        hidden_size=32,
+        hidden_size=64,
         num_hidden_layers=1,
         num_attention_heads=4,
         num_key_value_heads=2,
-        intermediate_size=64,
+        intermediate_size=128,
         max_position_embeddings=128,
         use_cuda=True,
     )

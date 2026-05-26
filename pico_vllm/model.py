@@ -442,6 +442,10 @@ class Qwen25_15B(nn.Module):
                 new_token_lens=new_token_lens,
                 q_start_loc=q_start_loc,
             )
+        # 只有最后一个位置的 logits 会被采样使用；KV 已在各层写入，
+        # 此处切片后 norm + lm_head 只对最后 token 计算，避免 prefill 尾部
+        # 对整段序列做 (seq, vocab) 的无用大 GEMM。
+        x = x[:, -1:, :]
         x = self.norm(x)
         return F.linear(x, self.embed_tokens.weight)
 
