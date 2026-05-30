@@ -47,24 +47,43 @@
 
 ### Flash Decode + Prefill 对比矩阵（H200, bfloat16, concurrency=1, best-of-3）
 
-GQA 分组 split-KV flash decode + GQA 分组 causal flash prefill（默认启用，`PICO_ATTN=legacy` 可回退到原始 kernel）。vLLM 开启其默认性能优化（CUDA Graph + async scheduling）。两个推理框架均关闭 prefix cache，采用同样的greedy decoding采样策略以确保比较的公平。每个格子的 `[×]` 是 `Pico-vLLM / vLLM` 的相对比值（吞吐越大越好，TTFT 越小越好）。
+测试条件：vLLM 开启其默认优化（CUDA Graph + async scheduling），两边都关闭 prefix cache、用相同的 greedy decoding，保证公平。每格 `[×]` 是 `Pico-vLLM / vLLM` 的比值（吞吐越大越好，TTFT 越小越好）。下表用各自的默认 attention kernel（decode = flash，prefill = v2）。
+
+#### 可选的 attention kernel
+
+decode 与 prefill 的 kernel 由 PICO_DECODE_ATTN、PICO_PREFILL_ATTN 分别选择，import 时读取一次并固化进 CUDA Graph；PICO_ATTN 为兼容别名，同时设定两者默认值。
+
+**Decode**：
+
+| PICO_DECODE_ATTN | 实现 |
+|:---|:---|
+| flash（默认） | 通过把 KV 序列切成多段并行计算，提升长上下文下的 SM 占用率。段数由 PICO_DECODE_SPLITS 设定，默认 32。 |
+| legacy | 单 program 走完整条 KV 序列，每个 query head 各自载入 K/V。 |
+
+**Prefill**：
+
+| PICO_PREFILL_ATTN | 实现 |
+|:---|:---|
+| v2（默认） | 通过把分块宽度从 page 大小解开并跨多个 page 取数，增大矩阵乘规约维度以提升算术强度。固定 BLOCK_M=64、BLOCK_N=32、num_warps=4、num_stages=3。 |
+| v1 | 通过让同组 query head 合用一次 K/V 载入，降低 KV 的重复读取。分块宽度等于 page 大小 16。 |
+| legacy | 每个 query head 各自遍历 KV。 |
 
 **Decode 吞吐 tok/s（output / 总时间），Pico-vLLM / vLLM [Pico÷vLLM]：**
 
 | input ＼ output | 16 | 128 | 1024 |
 |:---|:---:|:---:|:---:|
-| 64   | 422 / 400 **[1.05×]** | 527 / 471 **[1.12×]** | 536 / 478 **[1.12×]** |
-| 512  | 417 / 396 **[1.05×]** | 517 / 468 **[1.10×]** | 527 / 478 **[1.10×]** |
-| 2048 | 358 / 379 [0.95×] | 483 / 480 **[1.01×]** | 501 / 474 **[1.06×]** |
-| 8192 | 146 / 206 [0.71×] | 342 / 415 [0.82×] | 409 / 477 [0.86×] |
+| 64   | 432 / 401 **[1.08×]** | 528 / 472 **[1.12×]** | 535 / 479 **[1.12×]** |
+| 512  | 426 / 395 **[1.08×]** | 518 / 469 **[1.10×]** | 526 / 479 **[1.10×]** |
+| 2048 | 375 / 364 **[1.03×]** | 486 / 459 **[1.06×]** | 500 / 474 **[1.05×]** |
+| 8192 | 162 / 202 [0.80×] | 351 / 398 [0.88×] | 410 / 452 [0.91×] |
 
 **Prefill 延迟 TTFT ms，Pico-vLLM / vLLM [Pico÷vLLM]：**
 
 | input | 64 | 512 | 2048 | 8192 |
 |:---|:---:|:---:|:---:|:---:|
-| Pico-vLLM | 10.1 | 10.3 | 14.9 | 73.8 |
-| vLLM | 8.5 | 8.5 | 11.7 | 44.8 |
-| **比值 [×]** | **1.19×** | **1.20×** | **1.28×** | **1.65×** |
+| Pico-vLLM | 9.3 | 9.3 | 12.9 | 62.7 |
+| vLLM | 8.5 | 8.6 | 11.7 | 45.1 |
+| **比值 [×]** | **1.09×** | **1.08×** | **1.10×** | **1.39×** |
 
 复现（执行程序 `pico_vllm/tests/benchmark/accept_benchmark.py`，模型加载一次，每格 3 reps 取最优）：
 

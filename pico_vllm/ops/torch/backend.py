@@ -183,6 +183,37 @@ class TorchOps(OpsBackend):
             q_rot = q_rot_2d.reshape_as(q_rot)
         return q_rot
 
+    def fused_rope_and_cache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache_k: torch.Tensor,
+        kv_cache_v: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        context_lens: torch.Tensor,
+        check_ctx_len: bool = True,
+    ) -> torch.Tensor:
+        """CPU fused RoPE(Q, K) + KV cache write (parity with TritonOps).
+
+        The unified eager forward path now calls ``fused_rope_and_cache`` for
+        both prefill and eager decode, so the CPU backend must provide it too.
+        ``check_ctx_len`` exists only for signature parity with the Triton
+        kernel's ghost-row guard; on CPU the valid-token masking is derived from
+        ``context_lens`` inside ``decode_rope_and_cache`` (``_token_valid_mask``
+        accepts both ``(B,)`` prefill and ``(B,)``/``(B*seq,)`` decode shapes),
+        and prefill carries no ghost rows, so no extra handling is needed here.
+        """
+        del check_ctx_len
+        return self.decode_rope_and_cache(
+            q, k, v, cos, sin,
+            kv_cache_k, kv_cache_v,
+            slot_mapping,
+            context_lens,
+        )
+
     def paged_decode_attention(
         self,
         q: torch.Tensor,

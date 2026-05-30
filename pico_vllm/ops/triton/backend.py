@@ -13,11 +13,17 @@ class TritonOps(OpsBackend):
     device_type = "cuda"
     supports_cuda_graph = True
 
-    # Attention kernel selection (read once; constant for the run, so the choice
-    # is baked into the CUDA graph at capture time). Controls BOTH decode and
-    # prefill. Default "flash": GQA-grouped split-KV decode + GQA-grouped causal
-    # prefill. Set env PICO_ATTN=legacy to fall back to the original kernels.
-    _attn = os.environ.get("PICO_ATTN", "flash").lower()
+    # Attention kernel selection, read once at import so the choice is baked
+    # into the CUDA graph at capture time. Decode and prefill are selected
+    # independently:
+    #   PICO_DECODE_ATTN  = flash (default) | legacy
+    #   PICO_PREFILL_ATTN = v2 (default)    | v1 | legacy
+    # PICO_ATTN is a legacy alias kept for back-compat: it sets the default for
+    # both, but the per-path variables override it. PICO_ATTN=legacy therefore
+    # selects legacy on both paths; the explicit variables can mix freely.
+    _attn = os.environ.get("PICO_ATTN", "").lower()
+    _decode_attn = (os.environ.get("PICO_DECODE_ATTN") or _attn or "flash").lower()
+    _prefill_attn = (os.environ.get("PICO_PREFILL_ATTN") or _attn or "v2").lower()
 
     def create_rms_norm(self, hidden_size: int, eps: float = 1e-6) -> nn.Module:
         from .rms_norm import FastRMSNorm
@@ -100,7 +106,7 @@ class TritonOps(OpsBackend):
         MAX_BLOCKS_PER_SEQ: int,
         BLOCK_SIZE: int = 16,
     ) -> torch.Tensor:
-        if self._attn == "legacy":
+        if self._decode_attn == "legacy":
             from .attention import paged_decode_attention
 
             return paged_decode_attention(
@@ -139,7 +145,26 @@ class TritonOps(OpsBackend):
         BLOCK_M: int = 16,
         max_new_len: int | None = None,
     ) -> torch.Tensor:
-        if self._attn != "legacy":
+        # Default: v2 page-decoupled prefill kernel.
+        if self._prefill_attn not in ("legacy", "v1"):
+            from .flash_prefill_v2 import paged_prefill_attention_v2
+
+            return paged_prefill_attention_v2(
+                q,
+                k_cache,
+                v_cache,
+                block_table,
+                context_lens,
+                new_token_lens,
+                q_start_loc,
+                MAX_BLOCKS_PER_SEQ=MAX_BLOCKS_PER_SEQ,
+                BLOCK_SIZE=BLOCK_SIZE,
+                BLOCK_M=BLOCK_M,
+                max_new_len=max_new_len,
+            )
+
+        # Optional fallback: previous v1 GQA-grouped flash prefill.
+        if self._prefill_attn == "v1":
             from .flash_prefill import paged_prefill_attention_flash
 
             return paged_prefill_attention_flash(

@@ -2,7 +2,7 @@
 
 Drop-in replacement for `attention.paged_decode_attention` with the SAME
 signature and the SAME (B, N_HEAD, 1, HEAD_DIM) output layout, so the model /
-engine need no changes. Used by default; set env `PICO_ATTN=legacy`
+engine need no changes. Used by default; set env `PICO_DECODE_ATTN=legacy`
 (see ops/triton/backend.py) to fall back to the original kernel.
 
 Optimizations over the legacy decode kernel:

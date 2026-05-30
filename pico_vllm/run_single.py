@@ -1,9 +1,11 @@
 """Single-GPU smoke test: feed a few prompts through the Engine and print the
 generated text, to sanity-check that generation works end-to-end.
 
-Uses the default attention backend (flash). Set PICO_ATTN=legacy to compare:
-  PYTHONPATH=pico_vllm .venv-vllm019/bin/python pico_vllm/run_single.py            # flash (default)
-  PICO_ATTN=legacy PYTHONPATH=pico_vllm .venv-vllm019/bin/python pico_vllm/run_single.py
+Uses the default attention kernels (decode=flash, prefill=v2). Decode and
+prefill are selected independently via PICO_DECODE_ATTN / PICO_PREFILL_ATTN:
+  PYTHONPATH=pico_vllm .venv-vllm019/bin/python pico_vllm/run_single.py                       # defaults
+  PICO_DECODE_ATTN=legacy PYTHONPATH=pico_vllm .venv-vllm019/bin/python pico_vllm/run_single.py
+  PICO_PREFILL_ATTN=v1 PYTHONPATH=pico_vllm .venv-vllm019/bin/python pico_vllm/run_single.py
 """
 import os
 
@@ -51,7 +53,8 @@ engine = Engine(
 )
 engine.scheduler.max_num_seqs = max(8, len(PROMPTS))
 
-print(f"attention backend: PICO_ATTN={os.environ.get('PICO_ATTN', 'flash (default)')}")
+print(f"attention kernels: decode={os.environ.get('PICO_DECODE_ATTN', 'flash (default)')}, "
+      f"prefill={os.environ.get('PICO_PREFILL_ATTN', 'v2 (default)')}")
 
 id_to_prompt = {}
 for p in PROMPTS:
