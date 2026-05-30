@@ -15,8 +15,13 @@ class TritonOps(OpsBackend):
 
     # Attention kernel selection (read once; constant for the run, so the choice
     # is baked into the CUDA graph at capture time). Controls BOTH decode and
-    # prefill. Default "flash": GQA-grouped split-KV decode + GQA-grouped causal
-    # prefill. Set env PICO_ATTN=legacy to fall back to the original kernels.
+    # prefill. Default "flash": GQA-grouped split-KV decode + (for prefill) the
+    # page-decoupled, offline-tuned v2 kernel (flash_prefill_v2.py).
+    # PICO_ATTN options for the PREFILL path:
+    #   (default)      -> v2 page-decoupled kernel (BLOCK_N decoupled from page)
+    #   PICO_ATTN=v1   -> previous GQA-grouped flash prefill (flash_prefill.py)
+    #   PICO_ATTN=legacy -> original per-page prefill kernel (attention.py)
+    # Decode follows the same flash/legacy split as before.
     _attn = os.environ.get("PICO_ATTN", "flash").lower()
 
     def create_rms_norm(self, hidden_size: int, eps: float = 1e-6) -> nn.Module:
@@ -139,7 +144,26 @@ class TritonOps(OpsBackend):
         BLOCK_M: int = 16,
         max_new_len: int | None = None,
     ) -> torch.Tensor:
-        if self._attn != "legacy":
+        # Default: v2 page-decoupled prefill kernel.
+        if self._attn not in ("legacy", "v1"):
+            from .flash_prefill_v2 import paged_prefill_attention_v2
+
+            return paged_prefill_attention_v2(
+                q,
+                k_cache,
+                v_cache,
+                block_table,
+                context_lens,
+                new_token_lens,
+                q_start_loc,
+                MAX_BLOCKS_PER_SEQ=MAX_BLOCKS_PER_SEQ,
+                BLOCK_SIZE=BLOCK_SIZE,
+                BLOCK_M=BLOCK_M,
+                max_new_len=max_new_len,
+            )
+
+        # Optional fallback: previous v1 GQA-grouped flash prefill.
+        if self._attn == "v1":
             from .flash_prefill import paged_prefill_attention_flash
 
             return paged_prefill_attention_flash(
