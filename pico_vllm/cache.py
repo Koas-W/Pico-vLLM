@@ -142,18 +142,17 @@ class PagedKVCache():
 
     def get_prefill_slot_mapping(self, prefill_len: int) -> torch.Tensor:
         """
-        去掉冗余的 block_mapping 字典查询
+        全 GPU 向量化：从 gpu_block_table（已是 GPU tensor）gather 物理 block id，
+        再 + offset。零 Python 循环、零 host→device 拷贝、零同步点。
         """
-        slots = []
-        for i in range(prefill_len):
-            token_pos = self._seq_len + i
-            block_idx = token_pos // self.block_size
-            offset = token_pos % self.block_size
-            
-            physical_id = self.physical_block_ids[block_idx]
-            slots.append(physical_id * self.block_size + offset)
-            
-        return torch.tensor(slots, dtype=torch.int32, device=self.device)
+        start = self._seq_len
+        positions = torch.arange(
+            start, start + prefill_len, dtype=torch.int32, device=self.device
+        )
+        block_indices = positions // self.block_size
+        offsets = positions % self.block_size
+        physical = self.gpu_block_table[block_indices]
+        return physical * self.block_size + offsets
 
     def reset(self) -> None:
         """

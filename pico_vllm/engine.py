@@ -361,8 +361,8 @@ class Engine:
                 dtype=torch.long, device=self.device
             ).unsqueeze(0)
 
-            # 把输入转化为 Tensor
-            input_ids_tensor = torch.tensor(new_tokens).unsqueeze(0).to(self.device)
+            # 把输入转化为 Tensor（直接构在 device 上，省一次中间 CPU 张量）
+            input_ids_tensor = torch.tensor(new_tokens, dtype=torch.long, device=self.device).unsqueeze(0)
 
             bt = kv_cache.get_block_table()
             block_table = torch.full(
@@ -388,6 +388,7 @@ class Engine:
                     context_lens=context_lens,
                     new_token_lens=new_token_lens,
                     q_start_loc=q_start_loc,
+                    max_new_len=new_len,  # B=1 prefill：直接传 Python int，跳过 wrapper 内每层一次的 .item() 同步
                 )
 
             # t_sample = time.perf_counter()

@@ -137,6 +137,7 @@ class TritonOps(OpsBackend):
         MAX_BLOCKS_PER_SEQ: int,
         BLOCK_SIZE: int = 16,
         BLOCK_M: int = 16,
+        max_new_len: int | None = None,
     ) -> torch.Tensor:
         if self._attn != "legacy":
             from .flash_prefill import paged_prefill_attention_flash
@@ -152,6 +153,7 @@ class TritonOps(OpsBackend):
                 MAX_BLOCKS_PER_SEQ=MAX_BLOCKS_PER_SEQ,
                 BLOCK_SIZE=BLOCK_SIZE,
                 BLOCK_M=BLOCK_M,
+                max_new_len=max_new_len,
             )
 
         from .attention import paged_prefill_attention
@@ -167,4 +169,5 @@ class TritonOps(OpsBackend):
             MAX_BLOCKS_PER_SEQ=MAX_BLOCKS_PER_SEQ,
             BLOCK_SIZE=BLOCK_SIZE,
             BLOCK_M=BLOCK_M,
+            max_new_len=max_new_len,
         )
