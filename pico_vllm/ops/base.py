@@ -76,5 +76,6 @@ class OpsBackend(ABC):
         MAX_BLOCKS_PER_SEQ: int,
         BLOCK_SIZE: int = 16,
         BLOCK_M: int = 16,
+        max_new_len: int | None = None,
     ) -> torch.Tensor:
         ...

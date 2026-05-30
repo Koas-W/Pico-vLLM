@@ -235,8 +235,9 @@ class TorchOps(OpsBackend):
         MAX_BLOCKS_PER_SEQ: int,
         BLOCK_SIZE: int = 16,
         BLOCK_M: int = 16,
+        max_new_len: int | None = None,
     ) -> torch.Tensor:
-        del MAX_BLOCKS_PER_SEQ, BLOCK_M
+        del MAX_BLOCKS_PER_SEQ, BLOCK_M, max_new_len
 
         _, num_heads, head_dim = q.shape
         num_kv_heads = k_cache.shape[1]

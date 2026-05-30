@@ -224,6 +224,7 @@ def paged_prefill_attention(
     MAX_BLOCKS_PER_SEQ,
     BLOCK_SIZE=16,
     BLOCK_M=16,
+    max_new_len: int | None = None,
 ):
     total_new_tokens, N_HEAD, HEAD_DIM = q.shape
     N_KV_HEAD = k_cache.shape[1]
@@ -232,8 +233,10 @@ def paged_prefill_attention(
 
     out = torch.empty_like(q)
 
-    # num_q_blocks_max = 本 batch 中最长的 new_len 对应的 tile 数
-    max_new_len = int(new_token_lens.max().item())
+    # num_q_blocks_max = 本 batch 中最长的 new_len 对应的 tile 数。
+    # 若调用方在 prefill 入口已经算好,避开每层都做一次 .item() 同步。
+    if max_new_len is None:
+        max_new_len = int(new_token_lens.max().item())
     num_q_blocks = (max_new_len + BLOCK_M - 1) // BLOCK_M
 
     grid = (B, num_q_blocks, N_HEAD)

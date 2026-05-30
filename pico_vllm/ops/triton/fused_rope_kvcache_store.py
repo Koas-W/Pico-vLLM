@@ -21,22 +21,30 @@ def _fused_decode_rope_and_cache_kernel(
     stride_vc_blk, stride_vc_h, stride_vc_seq, stride_vc_d,
     
     # --- Dimensions ---
-    num_q_heads: tl.constexpr, 
+    num_q_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
-    head_dim: tl.constexpr, 
+    head_dim: tl.constexpr,
     block_size: tl.constexpr,
+    CHECK_CTX_LEN: tl.constexpr,
 ):
     """
     Grid: (total_tokens * num_q_heads,)
     每个 program 处理 1 个 token 的 1 个 Q head。
     附带处理 K 和 V 的写入（仅当 head_idx < num_kv_heads 时）。
+
+    CHECK_CTX_LEN: 是否做 context_lens[tok_idx] == 0 的早退检查。
+    decode (CUDA Graph) 路径 = True：context_lens 形状 (B,)、tok_idx == batch_idx，
+    用于跳过 ghost padding 行。
+    prefill 路径 = False：tok_idx 范围是 0..seq_len-1，超出 context_lens 形状，
+    且没有 ghost 行，跳过检查（同时省一次 load）。
     """
     pid = tl.program_id(0)
     tok_idx = pid // num_q_heads
     q_head_idx = pid % num_q_heads
 
-    ctx_len = tl.load(context_lens_ptr + tok_idx)
-    if ctx_len == 0:
+    if CHECK_CTX_LEN:
+        ctx_len = tl.load(context_lens_ptr + tok_idx)
+        if ctx_len == 0:
             return
     
     # 计算一半维度的 offset，用于 RoPE 旋转
@@ -107,6 +115,7 @@ def fused_decode_rope_and_cache(
     kv_cache_k: torch.Tensor, kv_cache_v: torch.Tensor,
     slot_mapping: torch.Tensor,
     context_lens: torch.Tensor,
+    check_ctx_len: bool = True,
 ) -> torch.Tensor:
     """
     输入:
@@ -157,6 +166,7 @@ def fused_decode_rope_and_cache(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         block_size=block_size,
+        CHECK_CTX_LEN=check_ctx_len,
     )
 
     # 恢复原有的形状返回给 Attention

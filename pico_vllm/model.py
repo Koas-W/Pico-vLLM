@@ -147,21 +147,24 @@ class GQAAttention(nn.Module):
         )
 
     def _prefill_attention(self, q, kv_cache_k, kv_cache_v,
-                        block_table, context_lens, new_token_lens, q_start_loc):
+                        block_table, context_lens, new_token_lens, q_start_loc,
+                        max_new_len: int | None = None):
         """
         q: (B, seq_len, n_heads, head_dim)  （目前 B=1）
         kv_cache_k/v: 已经写入 cache
-        
+        max_new_len: 调用方算好的 batch 最大 new_len(避免 wrapper 内 .item() 同步)
+
         新接口：调用 backend paged_prefill_attention
         """
         B, seq_len, _, _ = q.shape
         # 打平成 (total_tokens, n_heads, head_dim)
         q_flat = q.reshape(B * seq_len, self.cfg.local_num_attention_heads, self.cfg.head_dim)
-        
+
         out = self.ops.paged_prefill_attention(
             q_flat, kv_cache_k, kv_cache_v,
             block_table, context_lens, new_token_lens, q_start_loc,
             MAX_BLOCKS_PER_SEQ=block_table.shape[1],
+            max_new_len=max_new_len,
         )
         # 恢复 (B, seq_len, local_hidden)
         return out.reshape(B, seq_len, self.local_hidden)
@@ -190,6 +193,7 @@ class GQAAttention(nn.Module):
                 context_lens: Tensor | None = None,  # (B,) int32，每个请求当前长度
                 new_token_lens: Tensor | None = None,  # (B,) int32，每个请求需要新计算kv的token数
                 q_start_loc: Tensor | None = None,  # (B,) int32，每个请求q开始的位置
+                max_new_len: int | None = None,    # 调用方算好的 batch max new_len，避免 wrapper 内 .item() 同步
                 ) -> Tensor:                  # (B, seq_len, hidden_size)
         B, seq_len, _ = x.shape
         qkv = self.qkv_proj(x)  # (B, seq, q_size + k_size + v_size)
@@ -201,19 +205,21 @@ class GQAAttention(nn.Module):
         q = q.view(B, seq_len, self.cfg.local_num_attention_heads, self.cfg.head_dim)
         k = k.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
         v = v.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-        
-        # RoPE（两条路径共用）
-        q, k = RoPE.apply_rope(q, k, cos, sin)
-        # k/v reshape 成 (total_tokens, n_kv_heads, head_dim) 给 store kernel
-        k_flat = k.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-        v_flat = v.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
 
-        # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
-        self.ops.store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
+        # 融合 RoPE (Q, K) + KV cache 写入（与 forward_decode 复用同一个 kernel；
+        # prefill 没有 ghost padding 行，关闭 ctx_len 早退检查避免 OOB 读 context_lens）。
+        q = self.ops.fused_rope_and_cache(
+            q, k, v, cos, sin,
+            kv_cache_k, kv_cache_v,
+            slot_mapping,
+            context_lens,
+            check_ctx_len=False,
+        )
 
         if is_prefill:
             output = self._prefill_attention(q, kv_cache_k, kv_cache_v,
-                    block_table, context_lens, new_token_lens, q_start_loc)
+                    block_table, context_lens, new_token_lens, q_start_loc,
+                    max_new_len=max_new_len)
         else:
             output = self._decode_attention(q, kv_cache_k, kv_cache_v, block_table, context_lens)
 
@@ -310,8 +316,9 @@ class SwiGLUFFN(nn.Module):
     def forward(self, x):
         # x: (B, seq_len, hidden_size)
         gate_up = self.gate_up_proj(x)
-        gate, up = gate_up.split(self.cfg.local_intermediate_size, dim=-1)
-        output = self.down_proj(F.silu(gate) * up)  # (B, seq_len, hidden_size)
+        # 复用 forward_decode 用的融合 SwiGLU（silu + 逐元素相乘合一）；ops.swiglu
+        # 对前缀维度无关，prefill / eager-decode 都直接可用。
+        output = self.down_proj(self.ops.swiglu(gate_up))
         if self.cfg.tp_size > 1:
             dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
         return output  # (B, seq_len, hidden_size)
@@ -354,6 +361,7 @@ class TransformerBlock(nn.Module):
                 context_lens: Tensor | None = None,
                 new_token_lens: Tensor | None = None,
                 q_start_loc: Tensor | None = None,
+                max_new_len: int | None = None,
                 ):
         attn_out = self.attn(
             self.norm1(x), cos, sin,
@@ -365,6 +373,7 @@ class TransformerBlock(nn.Module):
             context_lens=context_lens,
             new_token_lens=new_token_lens,
             q_start_loc=q_start_loc,
+            max_new_len=max_new_len,
         )
         x = x + attn_out
         x = x + self.ffn(self.norm2(x))
@@ -423,12 +432,19 @@ class Qwen25_15B(nn.Module):
             context_lens: Tensor | None = None,  # decode: (B,)
             new_token_lens: Tensor | None = None,
             q_start_loc: Tensor | None = None,
+            max_new_len: int | None = None,      # 调用方算好的 batch max new_len（B=1 时 = new_len）
             ) -> Tensor:
-        
+
         x = self.embed_tokens(input_ids)
 
         # position_ids 直接用传入的，不再从 kv_caches 计算
         cos, sin = self.rope.get_cos_sin(position_ids)
+
+        # prefill 路径上 max_new_len 用于 prefill kernel 的 grid 计算。调用方
+        # （engine）一般会直接传 Python int 进来；若没传则在 model 入口一次性
+        # 算好，避免 28 层各自做一次 .item() 同步。
+        if is_prefill and max_new_len is None and new_token_lens is not None:
+            max_new_len = int(new_token_lens.max().item())
 
         for layer_idx, layer in enumerate(self.layers):
             x = layer(
@@ -441,6 +457,7 @@ class Qwen25_15B(nn.Module):
                 context_lens=context_lens,
                 new_token_lens=new_token_lens,
                 q_start_loc=q_start_loc,
+                max_new_len=max_new_len,
             )
         # 只有最后一个位置的 logits 会被采样使用；KV 已在各层写入，
         # 此处切片后 norm + lm_head 只对最后 token 计算，避免 prefill 尾部

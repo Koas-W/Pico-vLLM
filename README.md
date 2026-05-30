@@ -47,25 +47,26 @@
 
 ### Flash Decode + Prefill 对比矩阵（H200, bfloat16, concurrency=1, best-of-3）
 
-GQA 分组 split-KV flash decode + GQA 分组 causal flash prefill（默认启用，`PICO_ATTN=legacy` 可回退到原始 kernel）。vLLM 开启其默认性能优化（CUDA Graph + async scheduling）。两个推理框架均关闭 prefix cache，采用同样的greedy decoding采样策略以确保比较的公平。
+GQA 分组 split-KV flash decode + GQA 分组 causal flash prefill（默认启用，`PICO_ATTN=legacy` 可回退到原始 kernel）。vLLM 开启其默认性能优化（CUDA Graph + async scheduling）。两个推理框架均关闭 prefix cache，采用同样的greedy decoding采样策略以确保比较的公平。每个格子的 `[×]` 是 `Pico-vLLM / vLLM` 的相对比值（吞吐越大越好，TTFT 越小越好）。
 
-**Decode 吞吐 tok/s（output / 总时间），Pico-vLLM / vLLM：**
+**Decode 吞吐 tok/s（output / 总时间），Pico-vLLM / vLLM [Pico÷vLLM]：**
 
 | input ＼ output | 16 | 128 | 1024 |
 |:---|:---:|:---:|:---:|
-| 64   | 402 / 405 | 520 / 472 | 534 / 479 |
-| 512  | 379 / 399 | 506 / 470 | 523 / 479 |
-| 2048 | 326 / 364 | 470 / 459 | 495 / 474 |
-| 8192 | 131 / 200 | 330 / 399 | 404 / 451 |
+| 64   | 422 / 400 **[1.05×]** | 527 / 471 **[1.12×]** | 536 / 478 **[1.12×]** |
+| 512  | 417 / 396 **[1.05×]** | 517 / 468 **[1.10×]** | 527 / 478 **[1.10×]** |
+| 2048 | 358 / 379 [0.95×] | 483 / 480 **[1.01×]** | 501 / 474 **[1.06×]** |
+| 8192 | 146 / 206 [0.71×] | 342 / 415 [0.82×] | 409 / 477 [0.86×] |
 
-**Prefill 延迟 TTFT ms，Pico-vLLM / vLLM：**
+**Prefill 延迟 TTFT ms，Pico-vLLM / vLLM [Pico÷vLLM]：**
 
 | input | 64 | 512 | 2048 | 8192 |
 |:---|:---:|:---:|:---:|:---:|
-| Pico-vLLM | 12.1 | 13.7 | 19.2 | 86.2 |
-| vLLM | 8.1 | 8.1 | 11.7 | 44.6 |
+| Pico-vLLM | 10.1 | 10.3 | 14.9 | 73.8 |
+| vLLM | 8.5 | 8.5 | 11.7 | 44.8 |
+| **比值 [×]** | **1.19×** | **1.20×** | **1.28×** | **1.65×** |
 
-复现（执行程序 `pico_vllm/tests/benchmark/accept_benchmark.py`）：
+复现（执行程序 `pico_vllm/tests/benchmark/accept_benchmark.py`，模型加载一次，每格 3 reps 取最优）：
 
 ```bash
 PYTHONPATH=pico_vllm:pico_vllm/benchmarks python pico_vllm/tests/benchmark/accept_benchmark.py \

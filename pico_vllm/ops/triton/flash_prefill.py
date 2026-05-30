@@ -122,6 +122,7 @@ def paged_prefill_attention_flash(
     q, k_cache, v_cache, block_table,
     context_lens, new_token_lens, q_start_loc,
     MAX_BLOCKS_PER_SEQ, BLOCK_SIZE=16, BLOCK_M=16,
+    max_new_len: int | None = None,
 ):
     """Same signature/return as attention.paged_prefill_attention."""
     total_new_tokens, N_HEAD, HEAD_DIM = q.shape
@@ -131,7 +132,10 @@ def paged_prefill_attention_flash(
     scale = 1.0 / (HEAD_DIM ** 0.5)
 
     out = torch.empty_like(q)
-    max_new_len = int(new_token_lens.max().item())
+    # 调用方(model.forward)在 prefill 入口处一次性算好 max_new_len,
+    # 避免每层都做一次 .max().item() 的 host↔device 同步(28 层 × 5-10µs)。
+    if max_new_len is None:
+        max_new_len = int(new_token_lens.max().item())
 
     BLOCK_M = _PREFILL_BLOCK_M
     PADDED_M = triton.next_power_of_2(GROUP_SIZE * BLOCK_M)
