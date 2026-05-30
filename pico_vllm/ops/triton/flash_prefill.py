@@ -1,7 +1,8 @@
 """GQA-grouped, causal prefill attention kernel.
 
-Companion to flash_decode.py, gated by the SAME env var `PICO_ATTN`
-(default flash; PICO_ATTN=legacy falls back). Drop-in for
+Previous (v1) prefill kernel. The default prefill path is now the v2
+page-decoupled kernel (flash_prefill_v2.py); set `PICO_PREFILL_ATTN=v1` to
+select this one (see ops/triton/backend.py). Drop-in for
 `attention.paged_prefill_attention` (same signature and
 (total_new_tokens, N_HEAD, HEAD_DIM) output layout) -> no model/engine edits.
 

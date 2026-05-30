@@ -13,16 +13,17 @@ class TritonOps(OpsBackend):
     device_type = "cuda"
     supports_cuda_graph = True
 
-    # Attention kernel selection (read once; constant for the run, so the choice
-    # is baked into the CUDA graph at capture time). Controls BOTH decode and
-    # prefill. Default "flash": GQA-grouped split-KV decode + (for prefill) the
-    # page-decoupled, offline-tuned v2 kernel (flash_prefill_v2.py).
-    # PICO_ATTN options for the PREFILL path:
-    #   (default)      -> v2 page-decoupled kernel (BLOCK_N decoupled from page)
-    #   PICO_ATTN=v1   -> previous GQA-grouped flash prefill (flash_prefill.py)
-    #   PICO_ATTN=legacy -> original per-page prefill kernel (attention.py)
-    # Decode follows the same flash/legacy split as before.
-    _attn = os.environ.get("PICO_ATTN", "flash").lower()
+    # Attention kernel selection, read once at import so the choice is baked
+    # into the CUDA graph at capture time. Decode and prefill are selected
+    # independently:
+    #   PICO_DECODE_ATTN  = flash (default) | legacy
+    #   PICO_PREFILL_ATTN = v2 (default)    | v1 | legacy
+    # PICO_ATTN is a legacy alias kept for back-compat: it sets the default for
+    # both, but the per-path variables override it. PICO_ATTN=legacy therefore
+    # selects legacy on both paths; the explicit variables can mix freely.
+    _attn = os.environ.get("PICO_ATTN", "").lower()
+    _decode_attn = (os.environ.get("PICO_DECODE_ATTN") or _attn or "flash").lower()
+    _prefill_attn = (os.environ.get("PICO_PREFILL_ATTN") or _attn or "v2").lower()
 
     def create_rms_norm(self, hidden_size: int, eps: float = 1e-6) -> nn.Module:
         from .rms_norm import FastRMSNorm
@@ -105,7 +106,7 @@ class TritonOps(OpsBackend):
         MAX_BLOCKS_PER_SEQ: int,
         BLOCK_SIZE: int = 16,
     ) -> torch.Tensor:
-        if self._attn == "legacy":
+        if self._decode_attn == "legacy":
             from .attention import paged_decode_attention
 
             return paged_decode_attention(
@@ -145,7 +146,7 @@ class TritonOps(OpsBackend):
         max_new_len: int | None = None,
     ) -> torch.Tensor:
         # Default: v2 page-decoupled prefill kernel.
-        if self._attn not in ("legacy", "v1"):
+        if self._prefill_attn not in ("legacy", "v1"):
             from .flash_prefill_v2 import paged_prefill_attention_v2
 
             return paged_prefill_attention_v2(
@@ -163,7 +164,7 @@ class TritonOps(OpsBackend):
             )
 
         # Optional fallback: previous v1 GQA-grouped flash prefill.
-        if self._attn == "v1":
+        if self._prefill_attn == "v1":
             from .flash_prefill import paged_prefill_attention_flash
 
             return paged_prefill_attention_flash(
