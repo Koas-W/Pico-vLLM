@@ -201,15 +201,16 @@ class GQAAttention(nn.Module):
         q = q.view(B, seq_len, self.cfg.local_num_attention_heads, self.cfg.head_dim)
         k = k.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
         v = v.view(B, seq_len, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-        
-        # RoPE（两条路径共用）
-        q, k = RoPE.apply_rope(q, k, cos, sin)
-        # k/v reshape 成 (total_tokens, n_kv_heads, head_dim) 给 store kernel
-        k_flat = k.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
-        v_flat = v.reshape(-1, self.cfg.local_num_key_value_heads, self.cfg.head_dim)
 
-        # 统一写入 KV cache（prefill 和 decode 都用这个 kernel）
-        self.ops.store_kvcache(k_flat, v_flat, kv_cache_k, kv_cache_v, slot_mapping)# type:ignore
+        # 融合 RoPE (Q, K) + KV cache 写入（与 forward_decode 复用同一个 kernel；
+        # prefill 没有 ghost padding 行，关闭 ctx_len 早退检查避免 OOB 读 context_lens）。
+        q = self.ops.fused_rope_and_cache(
+            q, k, v, cos, sin,
+            kv_cache_k, kv_cache_v,
+            slot_mapping,
+            context_lens,
+            check_ctx_len=False,
+        )
 
         if is_prefill:
             output = self._prefill_attention(q, kv_cache_k, kv_cache_v,
@@ -310,8 +311,9 @@ class SwiGLUFFN(nn.Module):
     def forward(self, x):
         # x: (B, seq_len, hidden_size)
         gate_up = self.gate_up_proj(x)
-        gate, up = gate_up.split(self.cfg.local_intermediate_size, dim=-1)
-        output = self.down_proj(F.silu(gate) * up)  # (B, seq_len, hidden_size)
+        # 复用 forward_decode 用的融合 SwiGLU（silu + 逐元素相乘合一）；ops.swiglu
+        # 对前缀维度无关，prefill / eager-decode 都直接可用。
+        output = self.down_proj(self.ops.swiglu(gate_up))
         if self.cfg.tp_size > 1:
             dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.cfg.tp_group)
         return output  # (B, seq_len, hidden_size)

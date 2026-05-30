@@ -63,6 +63,33 @@ class TritonOps(OpsBackend):
             context_lens,
         )
 
+    def fused_rope_and_cache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache_k: torch.Tensor,
+        kv_cache_v: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        context_lens: torch.Tensor,
+        check_ctx_len: bool = True,
+    ) -> torch.Tensor:
+        """Generic fused RoPE (Q, K) + KV cache write. Same kernel as the decode
+        path; `check_ctx_len=False` for prefill (no ghost padding rows, and
+        per-token tok_idx would be out of bounds on the per-request
+        context_lens tensor)."""
+        from .fused_rope_kvcache_store import fused_decode_rope_and_cache
+
+        return fused_decode_rope_and_cache(
+            q, k, v, cos, sin,
+            kv_cache_k, kv_cache_v,
+            slot_mapping,
+            context_lens,
+            check_ctx_len=check_ctx_len,
+        )
+
     def paged_decode_attention(
         self,
         q: torch.Tensor,
